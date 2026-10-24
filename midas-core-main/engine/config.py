@@ -1,0 +1,519 @@
+"""Runtime configuration — single source of truth for paths, globals, and the roster.
+
+Replaces the former module-level ``Path(__file__).resolve().parents[1]`` data-root
+assumptions (which break once the package is pip-installed) and the hardcoded cast
+dicts scattered across engine.posts / engine.baselines / scripts.backfill_baselines.
+
+The project root is resolved from ``MIDAS_DATA_DIR`` (default: the repo root two
+levels up — legacy behaviour). The cast + globals load from ``<root>/roster.yaml``.
+"""
+
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from datetime import date
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+_LEGACY_ROOT = Path(__file__).resolve().parents[1]
+
+
+#: The benchmark "ticker" that reads no price: the initial capital held flat
+#: in cash. The one place the literal lives; read it through
+#: ``BenchmarkSpec.is_cash_flat``.
+CASH_FLAT_TICKER = "EUR_CASH_FLAT"
+
+
+@dataclass(frozen=True)
+class BenchmarkSpec:
+    label: str
+    ticker: str
+    currency: str
+
+    @property
+    def is_cash_flat(self) -> bool:
+        """A benchmark that reads no price and records no marks
+        (``CASH_FLAT_TICKER``)."""
+        return self.ticker == CASH_FLAT_TICKER
+
+
+@dataclass(frozen=True)
+class SafetyRails:
+    """Per-agent limits the broker enforces. The persona is aspirational; this binds.
+
+    ``max_order_notional_pct`` expresses the per-order cap as a percentage of
+    the book's **current** value rather than as an absolute amount, and takes
+    precedence over ``max_order_notional`` when set. A fixed cap has to be
+    chosen against a book size, and it silently stops binding as soon as the
+    book moves away from that size — the ten traders ran from day one with
+    `1_000_000` against €10,000 books, a cap 100x larger than the entire
+    portfolio, which is a rail that cannot fire. A percentage re-scales with
+    the book and needs no maintenance.
+
+    The absolute field stays for forks and for the allocator, whose cap is
+    deliberately a fixed small number.
+    """
+
+    max_order_notional: float = 500.0
+    max_order_notional_pct: float | None = None
+    max_orders_per_day: int = 5
+    daily_drawdown_halt_pct: float = -5.0
+    allowed_universe: tuple[str, ...] = ()
+    # Tickers this agent may never BUY (the broker refuses TICKER_DENIED); a
+    # SELL of one already held still fills. The Manager's is its PRIIPs list.
+    denied_tickers: tuple[str, ...] = ()
+    dry_run: bool = False
+
+
+@dataclass(frozen=True)
+class RiskBudget:
+    max_positions: int = 6
+    per_position_cap: float = 400.0
+    cash_floor: float = 150.0
+    max_trades_per_week: int = 2
+    min_conviction: int = 6
+
+
+@dataclass(frozen=True)
+class ResolvedBaseline:
+    """One allocator's control-book parameters after resolution.
+
+    What `baseline_params` returns: no field is Optional here, so a caller
+    cannot reach a live-desk constant by accident.
+    """
+
+    strategy_id: str
+    initial_capital: float
+    currency: str
+    position_size: float
+    max_positions: int
+
+
+@dataclass(frozen=True)
+class BaselineSpec:
+    """The deterministic control book for ONE allocator.
+
+    Every field is Optional and resolved against the allocator it controls
+    (see ``MidasConfig.baseline_params``) rather than defaulted to a live-desk
+    constant. Two allocators on one desk would otherwise share a single
+    control book, and a non-EUR desk would get an uncontrolled FX leg in the
+    very comparison the book exists to control for.
+    """
+
+    enabled: bool = True
+    strategy_id: str | None = None
+    initial_capital: float | None = None
+    position_size: float | None = None
+    max_positions: int | None = None
+
+
+@dataclass(frozen=True)
+class AllocatorSpec:
+    channels_prefix: str = "manager"
+    outcome_resolution_days: int = 10
+    outcome_memory_same_max: int = 5
+    outcome_memory_other_max: int = 3
+    baseline: BaselineSpec = field(default_factory=BaselineSpec)
+    risk_budget: RiskBudget = field(default_factory=RiskBudget)
+    # The prose side: rendered by manager_context.render_policy_prose when
+    # there is no prose_override. The broker enforces the same list through
+    # the allocator's `safety.denied_tickers` (see roster.yaml).
+    blocklist: tuple[str, ...] = ()
+    policy_prose_override: str | None = None
+
+    @property
+    def baseline_enabled(self) -> bool:
+        """Back-compat alias — `baseline.enabled` is the field."""
+        return self.baseline.enabled
+
+
+@dataclass(frozen=True)
+class JurisdictionSpec:
+    tax_rate_pct: float = 0.0  # core no-op default; FR sets 30.0
+    fees: dict = field(default_factory=dict)  # empty => fees.py module defaults
+
+
+@dataclass(frozen=True)
+class AgentSpec:
+    id: str
+    display_name: str
+    voice: str
+    post_time: str
+    home_currency: str
+    initial_capital: float
+    max_positions: int
+    universe: str | list[str] | None  # universe name, list of names, or unset
+    benchmark: BenchmarkSpec | None
+    persona: str
+    role: str = "trader"
+    safety: SafetyRails = field(default_factory=SafetyRails)
+    allocator: "AllocatorSpec | None" = None
+    # Arm of a pre-registered feed experiment this agent belongs to, or None
+    # for the control group. Declared here rather than inferred from the
+    # persona text so the session can report which arm it actually ran without
+    # grepping prose — see `scripts.daily_session.step_check_sentiment_freshness`.
+    sentiment_arm: str | None = None
+
+
+@dataclass(frozen=True)
+class MidasConfig:
+    data_dir: Path
+    day_one: date
+    currencies: tuple[str, ...]
+    initial_capital: float
+    global_reference: BenchmarkSpec
+    agents_dir: Path
+    roster: dict[str, AgentSpec]
+    jurisdiction: JurisdictionSpec
+
+    @property
+    def _data(self) -> Path:
+        return self.data_dir / "data"
+
+    @property
+    def posts_dir(self) -> Path:
+        return self._data / "posts"
+
+    @property
+    def baselines_dir(self) -> Path:
+        return self._data / "baselines"
+
+    @property
+    def ohlcv_dir(self) -> Path:
+        return self._data / "market" / "ohlcv"
+
+    @property
+    def news_dir(self) -> Path:
+        return self._data / "market" / "news"
+
+    @property
+    def sentiment_arm_log(self) -> Path:
+        return self._data / "market" / "sentiment_arm.jsonl"
+
+    @property
+    def journal_dir(self) -> Path:
+        return self._data / "agent_memory"
+
+    @property
+    def logs_dir(self) -> Path:
+        return self._data / "logs"
+
+    @property
+    def blog_dir(self) -> Path:
+        return self._data / "blog"
+
+    @property
+    def output_dir(self) -> Path:
+        return self._data / "output"
+
+    @property
+    def universes_dir(self) -> Path:
+        return self._data / "universes"
+
+    @property
+    def agent_config_dir(self) -> Path:
+        return self._data / "agent_config"
+
+    @property
+    def desk_notices_path(self) -> Path:
+        return self._data / "desk_notices.json"
+
+    @property
+    def orders_dir(self) -> Path:
+        return self._data / "orders"
+
+    @property
+    def tickers_path(self) -> Path:
+        return self._data / "tickers.json"
+
+    @property
+    def ticker_currencies_path(self) -> Path:
+        return self._data / "ticker_currencies.json"
+
+    @property
+    def portfolios_dir(self) -> Path:
+        return self._data / "portfolios"
+
+    @property
+    def leaderboard_dir(self) -> Path:
+        return self._data / "leaderboard"
+
+    @property
+    def tax_shadow_dir(self) -> Path:
+        return self._data / "tax_shadow"
+
+    @property
+    def research_dir(self) -> Path:
+        return self._data / "research"
+
+    @property
+    def session_state_dir(self) -> Path:
+        return self._data / "session_state"
+
+    @property
+    def trading_roster(self) -> tuple[str, ...]:
+        return tuple(aid for aid, spec in self.roster.items() if spec.role == "trader")
+
+    @property
+    def sentiment_treatment(self) -> tuple[str, ...]:
+        """Agents in the treatment arm of the pre-registered sentiment A/B.
+
+        Empty on any desk that does not run the experiment (including the
+        demo desk), which is what makes the arm check a no-op there rather
+        than a hardcoded live-cast reference in a shared module.
+        """
+        return tuple(
+            aid
+            for aid, spec in self.roster.items()
+            if spec.sentiment_arm == "treatment"
+        )
+
+    @property
+    def allocators(self) -> tuple[str, ...]:
+        return tuple(
+            aid for aid, spec in self.roster.items() if spec.role == "allocator"
+        )
+
+    @property
+    def narrators(self) -> tuple[str, ...]:
+        """Agents declared `role: narrator`, in roster order.
+
+        A desk may declare none (the demo desk does not), which is why every
+        caller iterates this rather than naming an id. Hardcoding `the-oracle`
+        is what fed the narrator the *trader* journal template on any fork
+        whose narrator is called something else — the template's three fact
+        slots are all structurally empty for an agent that holds no book, so
+        the narrator writes about a dark desk on sessions that traded.
+        """
+        return tuple(
+            aid for aid, spec in self.roster.items() if spec.role == "narrator"
+        )
+
+    def allocator_spec(self, agent_id: str) -> "AllocatorSpec":
+        spec = self.roster[agent_id].allocator
+        if spec is None:
+            raise ValueError(f"{agent_id!r} has no allocator config")
+        return spec
+
+    def baseline_params(self, agent_id: str) -> "ResolvedBaseline":
+        """Resolve one allocator's control-book parameters.
+
+        Anything the roster leaves unset is derived from that allocator's own
+        block, never from a live-desk constant: the id from the agent id, the
+        capital and currency from the agent, the position count from its risk
+        budget, and the position size from capital / positions. The live desk
+        pins `strategy_id` and `position_size` explicitly because its book
+        predates this resolution and its published history must not move.
+        """
+        agent = self.roster[agent_id]
+        spec = self.allocator_spec(agent_id)
+        b = spec.baseline
+        max_positions = b.max_positions or spec.risk_budget.max_positions
+        capital = (
+            b.initial_capital
+            if b.initial_capital is not None
+            else agent.initial_capital
+        )
+        return ResolvedBaseline(
+            strategy_id=b.strategy_id or f"{agent_id}-baseline",
+            initial_capital=float(capital),
+            currency=agent.home_currency,
+            position_size=(
+                b.position_size
+                if b.position_size is not None
+                else float(capital) / max(1, max_positions)
+            ),
+            max_positions=max_positions,
+        )
+
+
+def _benchmark(raw: dict | None) -> BenchmarkSpec | None:
+    if not raw:
+        return None
+    return BenchmarkSpec(
+        label=raw["label"], ticker=raw["ticker"], currency=raw["currency"]
+    )
+
+
+def _safety(raw: dict | None) -> SafetyRails:
+    raw = raw or {}
+    pct = raw.get("max_order_notional_pct")
+    return SafetyRails(
+        max_order_notional=float(raw.get("max_order_notional", 500.0)),
+        max_order_notional_pct=None if pct is None else float(pct),
+        max_orders_per_day=int(raw.get("max_orders_per_day", 5)),
+        daily_drawdown_halt_pct=float(raw.get("daily_drawdown_halt_pct", -5.0)),
+        allowed_universe=tuple(raw.get("allowed_universe", []) or []),
+        denied_tickers=tuple(raw.get("denied_tickers", []) or []),
+        dry_run=bool(raw.get("dry_run", False)),
+    )
+
+
+def _risk_budget(raw: dict | None) -> RiskBudget:
+    raw = raw or {}
+    return RiskBudget(
+        max_positions=int(raw.get("max_positions", 6)),
+        per_position_cap=float(raw.get("per_position_cap", 400.0)),
+        cash_floor=float(raw.get("cash_floor", 150.0)),
+        max_trades_per_week=int(raw.get("max_trades_per_week", 2)),
+        min_conviction=int(raw.get("min_conviction", 6)),
+    )
+
+
+def _allocator(raw: dict | None) -> AllocatorSpec | None:
+    if not raw:
+        return None
+    policy = raw.get("policy") or {}
+    mem = raw.get("outcome_memory") or {}
+    baseline = raw.get("baseline") or {}
+    return AllocatorSpec(
+        channels_prefix=str(raw.get("channels_prefix", "manager")),
+        outcome_resolution_days=int(raw.get("outcome_resolution_days", 10)),
+        outcome_memory_same_max=int(mem.get("same_ticker_max", 5)),
+        outcome_memory_other_max=int(mem.get("other_ticker_max", 3)),
+        baseline=BaselineSpec(
+            enabled=bool(baseline.get("enabled", True)),
+            strategy_id=(
+                str(baseline["strategy_id"]) if baseline.get("strategy_id") else None
+            ),
+            initial_capital=(
+                float(baseline["initial_capital"])
+                if baseline.get("initial_capital") is not None
+                else None
+            ),
+            position_size=(
+                float(baseline["position_size"])
+                if baseline.get("position_size") is not None
+                else None
+            ),
+            max_positions=(
+                int(baseline["max_positions"])
+                if baseline.get("max_positions") is not None
+                else None
+            ),
+        ),
+        risk_budget=_risk_budget(raw.get("risk_budget")),
+        blocklist=tuple(policy.get("blocklist", []) or []),
+        policy_prose_override=policy.get("prose_override"),
+    )
+
+
+def _jurisdiction(raw: dict | None) -> JurisdictionSpec:
+    raw = raw or {}
+    return JurisdictionSpec(
+        tax_rate_pct=float(raw.get("tax_rate_pct", 0.0)),
+        fees=dict(raw.get("fees") or {}),
+    )
+
+
+def _agent(agent_id: str, raw: dict, default_capital: float) -> AgentSpec:
+    return AgentSpec(
+        id=agent_id,
+        display_name=raw["display_name"],
+        voice=raw.get("voice", ""),
+        post_time=raw.get("post_time", ""),
+        home_currency=raw.get("home_currency", "EUR"),
+        initial_capital=float(raw.get("initial_capital", default_capital)),
+        max_positions=int(raw.get("max_positions", 5)),
+        universe=raw.get("universe"),
+        benchmark=_benchmark(raw.get("benchmark")),
+        persona=raw.get("persona", f"{agent_id}.md"),
+        role=raw.get("role", "trader"),
+        safety=_safety(raw.get("safety")),
+        allocator=_allocator(raw.get("allocator")),
+        sentiment_arm=raw.get("sentiment_arm"),
+    )
+
+
+def _resolve_data_dir() -> Path:
+    env = os.environ.get("MIDAS_DATA_DIR")
+    return Path(env).expanduser().resolve() if env else _LEGACY_ROOT
+
+
+def _load(data_dir: Path) -> MidasConfig:
+    raw = yaml.safe_load((data_dir / "roster.yaml").read_text(encoding="utf-8"))
+    g = raw["globals"]
+    day_one = g["day_one"]
+    if not isinstance(day_one, date):
+        day_one = date.fromisoformat(str(day_one))
+    default_capital = float(g.get("initial_capital", 10000.0))
+    roster = {aid: _agent(aid, a, default_capital) for aid, a in raw["agents"].items()}
+    return MidasConfig(
+        data_dir=data_dir,
+        day_one=day_one,
+        currencies=tuple(g.get("currencies", ["EUR", "USD"])),
+        initial_capital=default_capital,
+        global_reference=_benchmark(g["global_reference"]),
+        agents_dir=data_dir / g.get("agents_dir", ".claude/agents"),
+        roster=roster,
+        jurisdiction=_jurisdiction(g.get("jurisdiction")),
+    )
+
+
+@lru_cache(maxsize=1)
+def get_config() -> MidasConfig:
+    return _load(_resolve_data_dir())
+
+
+# Modules that derive their own caches from config paths (e.g. paper_broker's
+# ticker-currency override map) register a callback here so they are invalidated
+# in lockstep with the config cache. Without this, a MIDAS_DATA_DIR switch +
+# reset_config_cache() would leave those module caches pinned to the old tree.
+_RESET_CALLBACKS: list = []
+
+
+def register_reset_callback(fn) -> None:
+    """Register a zero-arg callback invoked after every reset_config_cache()."""
+    _RESET_CALLBACKS.append(fn)
+
+
+def reset_config_cache() -> None:
+    """Clear the cached config — for tests that change MIDAS_DATA_DIR between cases.
+
+    Also fires every registered reset callback so module-level caches keyed on
+    config paths are invalidated together.
+    """
+    get_config.cache_clear()
+    for fn in _RESET_CALLBACKS:
+        fn()
+
+
+def resolve_agent_universe(spec: AgentSpec) -> list[str]:
+    """Resolve an agent's universe (a name or list of names) to a ticker list.
+
+    ``spec.universe`` is a single universe name (str) or a list of names
+    (list[str]), each resolved via engine.universes.resolve_universe. The
+    composition rules replicate today's behaviour in scripts.backfill_baselines
+    verbatim:
+      - empty / None       -> []
+      - exactly one name   -> resolve_universe(name) (native order, NOT sorted)
+      - two or more names  -> sorted({t for n in names for t in resolve_universe(n)})
+
+    Inline-ticker fallback: if ANY name raises KeyError (i.e. it is not a
+    registered universe name), the whole list is treated as literal ticker
+    symbols and returned as-is. This lets forkers supply e.g.
+    ``universe: [SPY, QQQ, IWM]`` without registering a universe name.
+    William's live agents use only registered names, so they never hit this
+    path.
+    """
+    names = spec.universe
+    if not names:
+        return []
+    if isinstance(names, str):
+        names = [names]
+    from engine.universes import resolve_universe
+
+    try:
+        resolved = [resolve_universe(n) for n in names]
+    except (KeyError, FileNotFoundError):
+        # KeyError: not registry names → treat as literal tickers.
+        # FileNotFoundError: a registry name whose committed file is absent
+        # (STOXX 600 refuses to refresh itself on the session path) — same
+        # outcome, and the session must not die on it.
+        return list(names)
+    if len(names) == 1:
+        return resolved[0]  # single registered name → native order (unchanged)
+    return sorted({t for lst in resolved for t in lst})  # multi → sorted union

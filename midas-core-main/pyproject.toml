@@ -1,0 +1,171 @@
+[project]
+name = "midas-core"
+version = "0.1.2"
+description = "Multi-agent paper-trading framework: LLM agents propose trades, a separate broker validates and executes them."
+readme = "README.md"
+# Capped below 3.14 because pandas-ta pins a numba release with no 3.14 build:
+# `pip install midas-core` on 3.14 must fail at resolution with a clear message,
+# not deep inside a numba build. Lift the cap when pandas-ta is replaced.
+requires-python = ">=3.12,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "William Revah" }]
+keywords = [
+    "trading",
+    "backtesting",
+    "portfolio",
+    "paper-trading",
+    "quantitative-finance",
+    "multi-agent",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = [
+    "bt>=1.1.0",
+    "yfinance>=0.2.30",
+    "pandas>=2.0,!=3.0.4",
+    "pandas-ta>=0.4.67b0",
+    "numpy>=1.24",
+    # engine.market_data's parquet cache needs a parquet engine; without it the
+    # backtest runner raises its "usable engine" import error on a clean install.
+    "pyarrow>=14",
+    "requests>=2.31",
+    "ccxt>=4.0",
+    "PyYAML>=6.0",
+]
+# NOTE: requirements.txt remains the pinned lock everyone installs (pip-compile from
+# requirements.in). These loose constraints are the core runtime subset of
+# requirements.in (a curated subset, not a full mirror) for `pip install -e .`.
+
+
+# uv must NOT manage this project, and this line ENFORCES that rather than
+# describing it. `requirements.txt` is the resolved lockfile every consumer
+# installs; the loose constraints above are a curated runtime subset for
+# `pip install -e .` and packaging metadata, never a second source of truth.
+#
+# Without this line, `uv sync` or a bare `uv run` anywhere in the tree writes
+# a `uv.lock` from those eight constraints and rebuilds `.venv` from it. That
+# is not hypothetical: a stray lock sat in the live desk for four days holding
+# 65 packages against requirements.txt's 108 — and none of pytest, hypothesis,
+# fastapi or plotly, so the environment it produces cannot run the test suite
+# while looking like a working venv. `uv sync` also installs the project
+# editable by default, whose frozen finder tables are the documented
+# `MultiplexedPath` / `NotADirectoryError` break.
+#
+# Everything this project actually uses is unaffected: `uv venv`,
+# `uv pip install -r requirements.txt`, `pip install -e .` and `uv build` all
+# work. Verified with a control — the same `uv sync` creates `.venv` and
+# `uv.lock` without this line and refuses with it.
+[tool.uv]
+managed = false
+
+[project.urls]
+Homepage = "https://midas.revah.paris"
+Source = "https://github.com/w2ur/midas-core"
+Issues = "https://github.com/w2ur/midas-core/issues"
+
+[project.scripts]
+midas = "engine.cli:main"
+
+# Explicit package list, NOT auto-discovery: examples/demo-desk has to reach
+# site-packages under an importable name so `midas init-demo` can materialise it
+# through importlib.resources. tests/test_packaging_manifest.py guards the
+# engine/scripts half of this list against drift when a subpackage is added.
+[tool.setuptools]
+packages = [
+    "engine",
+    "engine.managers",
+    "engine.selectors",
+    "engine.universes",
+    "scripts",
+    "midas_demo_desk",
+]
+package-dir = { midas_demo_desk = "examples/demo-desk" }
+# Off deliberately: with manifest-driven inclusion on, setuptools treats every
+# identifier-named subdirectory holding data as an undeclared package and warns
+# ("midas_demo_desk.data.universes is absent from packages"). Declaring those
+# directories as packages would silence it but break `pip install -e .` in
+# midas-live, where the demo desk's data/ fixture does not exist. The globs
+# below are the whole contract instead.
+include-package-data = false
+
+[tool.setuptools.package-data]
+# Literal path prefixes, not a recursive `**`: glob() skips dot-directories for
+# wildcard segments, so a recursive pattern silently drops .claude/agents/*.md.
+midas_demo_desk = [
+    "README.md",
+    "roster.yaml",
+    ".claude/agents/*.md",
+    "data/universes/*.json",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+# backtester/tests is a second root, not a subdirectory of tests/: its 13 files
+# cover a service deployed to Cloud Run and were collected by nothing — CI ran
+# `pytest -q`, which honours testpaths, so they only ever ran when someone
+# typed the path by hand.
+#
+# This file syncs byte-identical to midas-core, which ships no backtester/.
+# A testpaths entry matching nothing is skipped silently there (probed on
+# pytest 9.1.1), so the mirror is unaffected — but that same silence means a
+# rename here would stop collecting them just as quietly, so the entry and the
+# directory are pinned together in tests/test_ci_guards.py.
+testpaths = ["tests", "backtester/tests"]
+pythonpath = ["."]
+markers = [
+    "live_cast: cast-coupled test — runs on the live desk, skipped on the demo desk (all-demo-* roster)",
+]
+
+# Zero-warnings policy, enforced rather than asserted. `error` first: any
+# warning this list does not name fails the suite, so a warning our own code
+# starts emitting cannot accumulate into background noise. The 69 occurrences
+# that existed on 2026-08-07 were all third-party and are named below — the
+# policy's "documented exception" requirement, made mechanical instead of
+# living in prose that drifts.
+#
+# A hard gate on warnings is normally fragile, because any upstream release can
+# add a deprecation and turn CI red for a reason nobody chose. It is safe HERE
+# specifically because `requirements.txt` is a fully-resolved lockfile: a new
+# third-party warning can only arrive with a deliberate lock bump, which is
+# exactly when someone should be looking at it. Do not copy this pattern into a
+# project with unpinned dependencies.
+#
+# Each ignore names a warning we cannot fix from here, in a dependency we do
+# not control. Matching is on the message, not the module, so an ignore stops
+# applying if the upstream text changes — a stale entry surfaces as a red run
+# rather than as silent over-suppression.
+filterwarnings = [
+    "error",
+    # starlette's TestClient, reached via fastapi.testclient in backtester/tests.
+    # Fixed only by migrating to httpx2, which is a dependency decision for the
+    # backtester spin-out, not for its test suite.
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated:",
+    # pandas_ta sets mode.copy_on_write at import. Under pandas >= 3 the option
+    # is a no-op and deprecated; nothing downstream of us can unset it.
+    "ignore:The 'mode.copy_on_write' option is deprecated:",
+    # bt's own chained assignment inside Backtest.get_transactions. Ours is the
+    # calling code, not the assignment; bt would have to fix it upstream.
+    "ignore:A value is being set on a copy of a DataFrame or Series through chained assignment:",
+    # yfinance's timezone cache (yfinance/cache.py -> peewee) opens a sqlite3
+    # connection per thread and never closes it; the interpreter reports it as
+    # unclosed when the garbage collector reaches it. Python 3.13 raises that as
+    # an unraisable exception during whichever later test is running, so the
+    # yfinance/bt network tests fail at random. Confirmed with tracemalloc: the
+    # allocation is peewee.connect <- yfinance cache, and no engine or script
+    # code opens sqlite. Scoped to the sqlite3 connection message only.
+    "ignore:unclosed database in <sqlite3:ResourceWarning",
+    "ignore:(?s).*unclosed database in <sqlite3:pytest.PytestUnraisableExceptionWarning",
+]

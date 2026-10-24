@@ -1,0 +1,2124 @@
+"""Fetch historical OHLCV for every symbol any strategy or portfolio might reference.
+
+Runs in a trusted environment (local dev or GitHub Actions) where yfinance
+works reliably. Output lives at data/market/ohlcv/{SYMBOL}.jsonl — one row per
+trading day, append-only, committed to git so sandboxed agents can read it.
+
+Not to be confused with scripts/fetch_market_data.py, which writes a single
+benchmark snapshot for the daily session dashboard.
+
+Usage:
+    python scripts/fetch_ohlcv.py
+    python scripts/fetch_ohlcv.py --history-days 60     # short refresh
+    python scripts/fetch_ohlcv.py --symbols AAPL,MSFT   # targeted
+    python scripts/fetch_ohlcv.py --dry-run             # list resolved symbols
+    python scripts/fetch_ohlcv.py --close-run eu        # tonight's European closes
+    python scripts/fetch_ohlcv.py --close-run us        # tonight's US closes
+    python scripts/fetch_ohlcv.py --settlement-shadow   # read-only: what a 10-day window would do
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+import tempfile
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import NamedTuple
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_PROJECT_ROOT))
+
+import pandas as pd
+import yfinance as yf
+
+from engine.config import get_config
+from engine.corporate_actions import (
+    CorporateAction,
+    detect_split,
+    explain_quarantine,
+    ratios_agree,
+)
+from engine.market_calendar import EU_CLOSE_SUFFIXES as _EU_CLOSE_SUFFIXES
+from engine.market_calendar import bucket_of
+from engine.market_calendar import close_run_bucket as _close_run_bucket
+from engine import instrument_status
+from engine.quotes import vendor_unit_scale
+from engine.ohlcv_ingest import (
+    MergeResult,
+    existing_dates as _existing_dates,
+    fetch_window_start,
+    flatten_columns,
+    merge_rows,
+)
+from engine.store_gaps import (
+    GAP_LOOKBACK_TRADING_DAYS,
+    HEAL_WINDOW_DAYS,
+    OPEN_VERDICTS,
+    PROBE_SIZE,
+    Verdict,
+    accepted_entry,
+    bucket_traded,
+    intraday_traded,
+    is_accepted,
+    lookback_start,
+    parse_ledger,
+    render_ledger,
+    scan_store,
+    verdict,
+)
+from engine.tickers import (
+    load_registry,
+    merge as _merge_registry,
+    resolve_name,
+    save_registry,
+)
+from engine.universes.index import (
+    get_sp500_tickers,
+    get_dow30_tickers,
+    get_nasdaq100_tickers,
+    get_cac40_tickers,
+    get_dax_tickers,
+    get_ftse100_tickers,
+    get_stoxx600_tickers,
+)
+from engine.universes.alternative import (
+    get_congressional_tickers,
+    get_insider_tickers,
+    get_high_short_tickers,
+)
+from engine.universes.assets import (
+    get_crypto_tickers,
+    get_crypto_eur_tickers,
+    get_forex_tickers,
+    get_metals_tickers,
+    get_voo_only,
+    get_classic_60_40,
+    get_bearish_etf_tickers,
+    get_bearish_etf_ucits_tickers,
+    get_commodities_eur_tickers,
+)
+
+
+def _fetch_ticker_info(symbol: str) -> dict | None:
+    """Fetch yfinance .info for a symbol. Returns None on any failure.
+
+    Names are best-effort — a yfinance hiccup must never fail the OHLCV run.
+    """
+    try:
+        return yf.Ticker(symbol).info  # type: ignore[no-any-return]
+    except Exception as exc:
+        print(f"  ! {symbol}: info fetch error — {exc}", file=sys.stderr)
+        return None
+
+
+# Reference symbols always fetched — used for market commentary and regime detection
+# even when no strategy directly references them.
+_MARKET_CONTEXT = [
+    "SPY",
+    "QQQ",
+    "IWM",
+    "DIA",  # Broad indices (ETFs)
+    "^VIX",  # Volatility
+    "GLD",
+    "SLV",
+    "TLT",  # Risk-off / safe-haven
+    "BTC-USD",
+    "ETH-USD",  # Crypto reference
+    "DX-Y.NYB",  # US Dollar Index
+]
+
+# Crypto reference subset — used for weekend fetches (crypto trades 24/7).
+_MARKET_CONTEXT_CRYPTO = ["BTC-USD", "ETH-USD"]
+
+# Static universes not covered by their own resolver.
+_ETF_SECTORS = [
+    "XLK",
+    "XLF",
+    "XLE",
+    "XLV",
+    "XLI",
+    "XLC",
+    "XLY",
+    "XLP",
+    "XLU",
+    "XLRE",
+    "XLB",
+]
+_ETF_BROAD = [
+    "VOO",
+    "QQQ",
+    "VEA",
+    "VWO",
+    "GLD",
+    "BND",
+    "TLT",
+    "IWM",
+    "DIA",
+    "HYG",
+    "URTH",
+    "VGK",
+]
+
+
+def _collect_holdings() -> set[str]:
+    """Return every ticker currently held across all portfolios."""
+    holdings: set[str] = set()
+    portfolios_dir = get_config().portfolios_dir
+    if not portfolios_dir.exists():
+        return holdings
+    for portfolio_dir in portfolios_dir.iterdir():
+        portfolio_file = portfolio_dir / "portfolio.json"
+        if not portfolio_file.exists():
+            continue
+        with portfolio_file.open() as f:
+            data = json.load(f)
+        for position in data.get("positions", []):
+            ticker = position.get("ticker")
+            if ticker:
+                holdings.add(ticker)
+    return holdings
+
+
+#: Every declared universe resolver, in the order they are asked.
+_UNIVERSE_RESOLVERS = (
+    get_sp500_tickers,
+    get_dow30_tickers,
+    get_nasdaq100_tickers,
+    get_cac40_tickers,
+    get_dax_tickers,
+    get_ftse100_tickers,
+    get_stoxx600_tickers,
+    get_crypto_tickers,
+    get_crypto_eur_tickers,
+    get_forex_tickers,
+    get_metals_tickers,
+    get_voo_only,
+    get_classic_60_40,
+    get_bearish_etf_tickers,
+    get_bearish_etf_ucits_tickers,
+    get_commodities_eur_tickers,
+    get_congressional_tickers,
+    get_insider_tickers,
+    get_high_short_tickers,
+)
+
+
+#: The resolvers that raised during the last `_collect_universe_symbols`, or
+#: None when it has not run in this process. A full run may close out a
+#: departed symbol's ledger entries only when this is an empty list: a failed
+#: resolver makes every symbol only it names look departed (follow-up review
+#: r8, r5 M2), and a close-out older than the lookback is permanent.
+_resolver_failures: list[str] | None = None
+
+
+def _collect_universe_symbols() -> set[str]:
+    """Union of every ticker across every declared universe resolver."""
+    global _resolver_failures
+    failures: list[str] = []
+    symbols: set[str] = set()
+    for resolver in _UNIVERSE_RESOLVERS:
+        try:
+            symbols.update(resolver())
+        except Exception as exc:
+            failures.append(getattr(resolver, "__name__", repr(resolver)))
+            print(f"  ! {resolver.__name__} failed: {exc}", file=sys.stderr)
+    _resolver_failures = failures
+    symbols.update(_ETF_SECTORS)
+    symbols.update(_ETF_BROAD)
+    return symbols
+
+
+def _all_symbols() -> list[str]:
+    universe = _collect_universe_symbols()
+    holdings = _collect_holdings()
+    context = set(_MARKET_CONTEXT)
+    return sorted(universe | holdings | context)
+
+
+def _crypto_symbols() -> list[str]:
+    """Weekend fetch subset — crypto pairs only (24/7 markets).
+
+    Union of `crypto-top20` (USD) + `crypto-top20-eur` + crypto context +
+    any currently held ticker ending in `-EUR` or `-USD` that looks like
+    a crypto pair (upper-case ticker, not a stock).
+    """
+    symbols: set[str] = set()
+    for resolver in (get_crypto_tickers, get_crypto_eur_tickers):
+        try:
+            symbols.update(resolver())
+        except Exception as exc:
+            print(f"  ! {resolver.__name__} failed: {exc}", file=sys.stderr)
+    symbols.update(_MARKET_CONTEXT_CRYPTO)
+    for held in _collect_holdings():
+        if held.endswith("-EUR") or held.endswith("-USD"):
+            symbols.add(held)
+    return sorted(symbols)
+
+
+#: Fraction of *already-covered* symbols that may return nothing before the run
+#: is a failure rather than a set of delistings. See the exit path in `main` for
+#: why this is a rate, and why the denominator is store coverage rather than the
+#: whole symbol list.
+MAX_FAILURE_RATE = 0.10
+
+#: Fraction of *already-covered* symbols that may lack the same date (served
+#: with no close) before that date is a vendor-wide hole rather than a few thin
+#: names. 2026-09-22: the vendor served SPY and most of the US universe with no
+#: close; the run wrote 84 new rows across 1,247 symbols, exited 0, and every
+#: equity book priced a day stale that evening. A holiday is not a hole: the
+#: vendor serves no row at all for a closed market, so it never lands here.
+MAX_HOLE_RATE = 0.10
+
+#: Fewest covered symbols the hole rate is taken over. A rate over a handful of
+#: symbols describes those symbols, not the vendor: `--symbols EURUSD=X` read
+#: 1/1 = 100% (money review round 1, M2). 20 keeps the crypto-only run (~35
+#: symbols) measured — crypto trades every day, so a shared hole there is real —
+#: while a targeted local or `--resweep --symbols` run of a few names never
+#: reads as an outage. At 20, one symbol is 5% and a firing needs at least 3.
+MIN_HOLE_POPULATION = 20
+
+
+def vendor_wide_holes(
+    holes_by_date: dict[str, int], considered_covered: int
+) -> dict[str, int]:
+    """The dates missing from more than ``MAX_HOLE_RATE`` of covered symbols.
+
+    Nothing is measured below ``MIN_HOLE_POPULATION`` covered symbols.
+    """
+    if considered_covered < MIN_HOLE_POPULATION:
+        return {}
+    return {
+        d: n
+        for d, n in sorted(holes_by_date.items())
+        if n / considered_covered > MAX_HOLE_RATE
+    }
+
+
+#: Fewest covered symbols a bucket needs for the small-bucket rule, used below
+#: MIN_HOLE_POPULATION: such a bucket is a hole when MORE THAN HALF of its
+#: covered members lack the same date (SMALL_BUCKET_HOLE_SHARE). Ten FX pairs
+#: and the small exchanges (`.VI`, `.IR`, `.LS`, `.WA`, `.HE`, `.BR` as
+#: fetched) sit under the rate's floor; there 10% is one or two names, which
+#: is routine. Below 5 a whole bucket is a couple of names (`.F`, `.NYB`: 1
+#: each), which says nothing about a vendor.
+MIN_SMALL_BUCKET_POPULATION = 5
+
+#: The share of a small bucket that must lack a date for it to be a hole.
+#: It was "every member" until follow-up money review r2, N1: the real holes
+#: in the logs were near-total, not total — `.WA` 17 of 18 on 2026-09-17 and
+#: `.HE` 16 of 17 on 2026-09-22 — so one straggler hid the whole exchange. A
+#: majority fires on both, and the worst healthy night in the 09-18..09-25
+#: replay was `.WA` 2 of 18 (11%); August's all-late small exchanges read as
+#: holes too, which they were (a day stale at session time).
+SMALL_BUCKET_HOLE_SHARE = 0.5
+
+
+#: The population ``symbol``'s missing closes are rated within. One definition,
+#: in the engine since 2026-10-03 because the broker's STALE_PRICE rail judges a
+#: price's age within the same bucket (`engine.market_calendar.bucket_of`).
+hole_bucket = bucket_of
+
+
+#: Which same-evening pass collects a symbol. Defined in the engine since
+#: 2026-10-04, because `engine.stale_marks` must know which buckets a session
+#: holds at the row's own date and which only at the previous one; re-exported
+#: here, where the close runs select by it.
+EU_CLOSE_SUFFIXES = _EU_CLOSE_SUFFIXES
+close_run_bucket = _close_run_bucket
+
+
+def _report_close_run_reach(
+    close_run: str, end: date, reached: dict[str, list[int]]
+) -> None:
+    """Per exchange, how many of tonight's served symbols carried ``end``'s close.
+
+    Deliberately not an exit code. A bucket that served nothing for ``end`` is
+    either the vendor publishing late — the measured population window opens
+    ~1.5 h after the bell — or a holiday on that exchange, and at this hour the
+    two have the same shape. Either way the next evening's revision window
+    and the store-gap pass land the date once it exists, and tonight's session
+    marks that bucket at its previous close. The `::warning::` names it, so the
+    run summary says which books that was.
+    """
+    if not reached:
+        print(f"\nClose run ({close_run}): no symbol served a frame for {end}.")
+        print(
+            f"::warning::close run ({close_run}) reached nothing for {end} — "
+            "the vendor served no frame at all; tonight's session marks this "
+            "bucket at the previous close"
+        )
+        return
+    parts = []
+    short: list[str] = []
+    for ex, (got, served) in sorted(reached.items()):
+        label = ex or "US"
+        parts.append(f"{label} {got}/{served}")
+        if got == 0:
+            short.append(f"{label} (0/{served})")
+    print(f"\nClose run ({close_run}) reach for {end}: " + ", ".join(parts) + ".")
+    if short:
+        print(
+            f"::warning::close run ({close_run}): no {end} close served for "
+            + ", ".join(short)
+            + " — vendor late or exchange closed; those books mark at the "
+            "previous close tonight, and the date lands with the next pass"
+        )
+
+
+def exchange_wide_holes(
+    holes_by_exchange: dict[str, dict[str, int]],
+    covered_by_exchange: dict[str, int],
+) -> dict[str, dict[str, int]]:
+    """``vendor_wide_holes`` taken per `hole_bucket`: the same rate, the same
+    population floor, over each bucket's own covered symbols — and, for a
+    bucket between MIN_SMALL_BUCKET_POPULATION and that floor, a hole when
+    more than SMALL_BUCKET_HOLE_SHARE of its covered members lack the date.
+
+    A covered symbol whose download came back EMPTY counts as lacking `end`
+    (the caller records it so): it did not advance either (follow-up review
+    r3, M5).
+
+    J6 money review round 2, N4: over the whole universe (~1,320 covered
+    symbols) a hole across every `.PA` (82) or `.DE` (83) name reads ~6%,
+    under MAX_HOLE_RATE, and the run exited 0 while those books priced a day
+    stale. The 17 UCITS ETFs the vendor serves a day late (round 1, I4) sit at
+    3-6% of their exchange, so they stay under the rate here too.
+    """
+    wide: dict[str, dict[str, int]] = {}
+    for exchange, holes in sorted(holes_by_exchange.items()):
+        covered = covered_by_exchange.get(exchange, 0)
+        if MIN_SMALL_BUCKET_POPULATION <= covered < MIN_HOLE_POPULATION:
+            found = {
+                d: n
+                for d, n in sorted(holes.items())
+                if n / covered > SMALL_BUCKET_HOLE_SHARE
+            }
+        else:
+            found = vendor_wide_holes(holes, covered)
+        if found:
+            wide[exchange] = found
+    return wide
+
+
+#: Deliberate non-zero exits. Distinct from 1 on purpose: 1 is what an
+#: unhandled traceback exits with, and the workflow must be able to tell "I
+#: refused this data, commit the rest and go red" from "I crashed at symbol 500
+#: of 1,150". Committing the latter publishes a store where a third of the
+#: symbols carry today's bar and the rest stop at yesterday's — and the session
+#: that prices it writes ONE immutable snapshot row per book, so the books mark
+#: at different dates with no writer responsible and no way to correct it
+#: (`add_snapshot` refuses a later session's rewrite of that market date).
+EXIT_QUARANTINED = 2
+EXIT_VENDOR_OUTAGE = 3
+#: The stored series still skips a trading day after the run refetched it (a
+#: date the vendor serves with no close, or cannot be asked about). Follow-up
+#: review r6, I1: the hole used to be visible only on the night the vendor
+#: served it, so the next night exited 0 and `failure-issue` closed the alert
+#: as "Recovered" with the date missing for good. The run stays red while
+#: `data/market/store_gaps.json` holds an in-scope gap, so only a night that
+#: finds the store holding the date can close it.
+EXIT_STORE_GAP = 4
+
+#: The exits on which the workflow should still commit what arrived.
+COMMITTABLE_EXITS = (0, EXIT_QUARANTINED, EXIT_VENDOR_OUTAGE, EXIT_STORE_GAP)
+
+
+def _fetch_symbol(
+    symbol: str, start: date, end: date, *, vendor_unit: str | None = None
+) -> pd.DataFrame | None:
+    """Fetch OHLCV for a single symbol. Returns None on failure.
+
+    ``vendor_unit`` is the quote unit the vendor reports for the symbol, passed
+    on a FIRST ingest when the registry has no entry yet — see
+    `engine.quotes.vendor_unit_scale`.
+    """
+    try:
+        df = yf.download(
+            symbol,
+            start=str(start),
+            end=str(end + timedelta(days=1)),  # yfinance end is exclusive
+            auto_adjust=False,  # keep raw Close + Adj Close separately
+            progress=False,
+            threads=False,
+            # yfinance drops a row whose prices and volume are all NaN/0 by
+            # default. That is how the vendor serves a real trading day it has
+            # no price for (all 24 `.CO` files on 2026-03-23, a full session on
+            # the 1h bars), and dropped, it read as a holiday everywhere:
+            # "closed" to the store-gap probe and invisible to the nightly hole
+            # check (follow-up review r8, r4 I1). Kept, then filtered below.
+            keepna=True,
+        )
+    except Exception as exc:
+        print(f"  ! {symbol}: download error — {exc}", file=sys.stderr)
+        return None
+    if df is not None and not df.empty:
+        df = _drop_uninformative_null_rows(symbol, flatten_columns(df))
+    if df is None or df.empty:
+        # Silent until 2026-08-07 (W2.5). An empty frame is how a delisting, a
+        # renamed symbol and a vendor-side outage all present, and they are
+        # indistinguishable here — but a run where hundreds of them happen at
+        # once is very distinguishable from one where two do, and that is the
+        # signal the exit code below is built on.
+        print(f"  ! {symbol}: vendor returned no rows", file=sys.stderr)
+        return None
+    return _normalise_vendor_units(symbol, flatten_columns(df), vendor_unit=vendor_unit)
+
+
+def _is_null_row(close: object, volume: object) -> bool:
+    """The vendor's null row: no close and no volume."""
+    return bool(pd.isna(close)) and (bool(pd.isna(volume)) or volume == 0)
+
+
+def _drop_uninformative_null_rows(symbol: str, df: pd.DataFrame) -> pd.DataFrame:
+    """Drop the null rows that carry no signal, as yfinance's default did.
+
+    A null row is kept only for a cash listing whose frame carries volume: there
+    it is the vendor's presentation of a day it has no price for, and it is
+    either a hole or a holiday, which the 1h bars settle
+    (`_fetch_intraday_volume`). It is dropped, and reads as no daily bar at all,
+    for:
+
+    - futures (`=F`): a daily bar is a settlement convention. On Juneteenth
+      2025, CME traded (GC=F's 1h volume at 0.90 of its median) while NYSE was
+      shut, and the vendor served the futures a null daily row. Keeping it
+      would hold every CME-open US holiday red.
+    - FX (`=X`), indices (`^`), and any frame with no positive volume anywhere
+      (DX-Y.NYB): their volume is always zero, so neither the row nor the 1h
+      bars can tell 12-25 from a trading day, and the null row there is a
+      holiday as often as not (FX 12-25 and 01-01, ^VIX 07-04).
+    """
+    if "Close" not in df.columns or "Volume" not in df.columns:
+        return df
+    null = [_is_null_row(c, v) for c, v in zip(df["Close"], df["Volume"])]
+    if not any(null):
+        return df
+    informative = (
+        not symbol.endswith(("=F", "=X"))
+        and not symbol.startswith("^")
+        and bool((df["Volume"].fillna(0) > 0).any())
+    )
+    if informative:
+        return df
+    return df[[not n for n in null]]
+
+
+def _fetch_intraday_volume(symbol: str, end: date) -> dict[str, float] | None:
+    """date -> the vendor's 1h volume for ``symbol``, or None if unavailable.
+
+    One request over the vendor's whole 1h horizon (730 days back). It settles
+    a daily null row (`engine.store_gaps.intraday_traded`); a failure here
+    leaves the day undecided, which holds it, and is never read as a holiday.
+    """
+    try:
+        df = yf.download(
+            symbol,
+            # The vendor's 1h horizon counts back from NOW, not from `end`:
+            # asked from `end` - 729 days it refused the whole request ("must
+            # be within the last 730 days") for every symbol on 2026-09-26.
+            start=str(date.today() - timedelta(days=INTRADAY_HORIZON_DAYS)),
+            end=str(end + timedelta(days=1)),
+            interval="1h",
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+    except Exception as exc:
+        print(f"  ! {symbol}: 1h download error — {exc}", file=sys.stderr)
+        return None
+    if df is None or df.empty:
+        return None
+    df = flatten_columns(df)
+    if "Volume" not in df.columns:
+        return None
+    volume = df["Volume"].fillna(0)
+    by_day: dict[str, float] = {}
+    for ts, v in volume.items():
+        key = ts.date().isoformat()
+        by_day[key] = by_day.get(key, 0.0) + float(v)
+    return by_day
+
+
+#: The vendor serves 1h bars for the last 730 days, counted from today. Five
+#: days of margin: 730 exactly was refused at the boundary (time zones).
+INTRADAY_HORIZON_DAYS = 725
+
+
+#: Price columns yfinance serves in the vendor's quote unit. `Volume` is a
+#: share count, not a price, and must never be scaled.
+_PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close")
+
+
+def _normalise_vendor_units(
+    symbol: str, df: pd.DataFrame, *, vendor_unit: str | None = None
+) -> pd.DataFrame:
+    """Scale a fetched frame from the vendor's quote unit into ISO currency.
+
+    The LSE quotes in pence, so yfinance serves `LLOY.L` at 116.60 meaning
+    GBP 1.166. **The store is ISO-denominated**, so that division happens
+    here, once, on the way in — rather than in every one of the many places
+    that later read a price back out. Three read paths forgot it before it
+    was centralised, and centralising it on the read side still left agents
+    reading raw pence out of the store while their books were in pounds.
+
+    Applies to the freshly fetched frame only, which is also what
+    `engine.corporate_actions.detect_split` compares against the store — so
+    the two stay in the same units and a normalised store does not read as a
+    clean 100:1 "split" on every London ticker.
+    """
+    scale = vendor_unit_scale(symbol, unit=vendor_unit)
+    if scale == 1.0:
+        return df
+    out = df.copy()
+    for column in _PRICE_COLUMNS:
+        if column in out.columns:
+            out[column] = out[column] * scale
+    return out
+
+
+def _write_rows(
+    symbol: str,
+    df: pd.DataFrame,
+    revise_from: str | None = None,
+    *,
+    guard_anomalies: bool = False,
+) -> MergeResult:
+    """Merge new daily rows into data/market/ohlcv/{SYMBOL}.jsonl.
+
+    Thin wrapper over engine.ohlcv_ingest.merge_rows — resolves the config-backed
+    store path, then delegates the normalize/merge/idempotent-write logic to the
+    tested engine module.
+
+    ``guard_anomalies`` turns on the ingest tripwire, quarantining a revision or
+    new row that moves implausibly far. It is on for the nightly one-day-window
+    run, where rewriting history wholesale is never legitimate, and OFF for a
+    resweep, where a real corporate action legitimately rewrites hundreds of
+    rows and ``engine.corporate_actions.detect_split`` is what adjudicates them.
+    """
+    path = get_config().ohlcv_dir / f"{symbol}.jsonl"
+    quarantine = None
+    if guard_anomalies:
+        quarantine = (
+            get_config().data_dir / "data" / "market" / "quarantine" / f"{symbol}.jsonl"
+        )
+    merged = merge_rows(path, df, revise_from, quarantine=quarantine)
+    if merged.quarantined:
+        _suspend(symbol, merged)
+    return merged
+
+
+def _suspend(symbol: str, merged: MergeResult) -> None:
+    """A tripwire refusal marks the symbol ``suspended`` in the status registry.
+
+    The store has stopped short of what the vendor served, so its newest close
+    may belong to a different instrument (CTVA 2026-10-01). Only adjudication
+    clears it: `_adjudicate` once its re-merge lands, or a human. A registry
+    that cannot be read is left untouched and said so: `status_of` already
+    answers ``suspended`` for every symbol while it is unreadable, and the run
+    is red anyway, because the refusal itself exits non-zero.
+    """
+    dates = sorted(r.date for r in merged.refused)
+    since = dates[0] if dates else date.today().isoformat()
+    try:
+        instrument_status.mark_suspended(
+            symbol,
+            since=since,
+            source="tripwire",
+            reason=(
+                f"ingest tripwire refused {merged.quarantined} row(s)"
+                + (f" ({', '.join(dates)})" if dates else "")
+                + "; see data/market/quarantine/"
+            ),
+        )
+    except instrument_status.RegistryUnreadable as exc:
+        print(
+            f"ERROR: instrument status registry unreadable ({exc}); "
+            f"{symbol} not recorded as suspended (every lookup fails closed).",
+            file=sys.stderr,
+        )
+
+
+def _read_store_rows(path: Path) -> list[dict]:
+    """Read every row of a {SYMBOL}.jsonl store file as dicts, pre-write.
+
+    Missing file, blank lines, and unparseable lines are skipped rather than
+    raising — mirrors engine.ohlcv_ingest.existing_dates' defensive parsing,
+    so one corrupt line never aborts the run.
+    """
+    if not path.exists():
+        return []
+    rows: list[dict] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows
+
+
+def _ledger_path() -> Path:
+    """Where adjudicated corporate actions are recorded.
+
+    Beside the store it describes, so it travels under the same push gate:
+    evidence that only exists on an ephemeral runner is no evidence.
+    """
+    return get_config().data_dir / "data" / "market" / "corporate_actions.jsonl"
+
+
+def _adjudicated_keys() -> set[tuple[str, str]] | None:
+    """Every (symbol, effective) already applied. ``None`` means UNREADABLE.
+
+    The distinction is load-bearing and the caller must not collapse it.
+    `apply_split` mutates real share counts, and both the nightly fetch and
+    the weekly resweep can see the same action; applying one twice halves a
+    book twice, silently, with the cost basis invariant hiding it. So a
+    ledger we cannot read has to stop adjudication altogether rather than
+    degrade to "assume nothing was applied" — the money path fails closed.
+    """
+    path = _ledger_path()
+    if not path.exists():
+        return set()
+    keys: set[tuple[str, str]] = set()
+    try:
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                keys.add((record["symbol"], record["effective"]))
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        print(
+            f"ERROR: corporate-action ledger at {path} is unreadable ({exc}); "
+            "refusing to adjudicate anything this run.",
+            file=sys.stderr,
+        )
+        return None
+    return keys
+
+
+def _record_adjudication(
+    action: CorporateAction, holders: list[str], refused_count: int
+) -> None:
+    """Append one row. The ledger is the disclosure artifact for this path."""
+    path = _ledger_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "symbol": action.symbol,
+        "effective": action.effective,
+        "shares_ratio": action.shares_ratio,
+        "price_ratio": action.price_ratio,
+        "source": "vendor-calendar",
+        "adjudicated_at": date.today().isoformat(),
+        "rows_explained": refused_count,
+        "holders_adjusted": holders,
+    }
+    with path.open("a") as f:
+        f.write(json.dumps(record) + "\n")
+
+
+def _fetch_actions(symbol: str) -> list[CorporateAction]:
+    """The vendor's split calendar for one symbol.
+
+    Fetched ONLY for symbols the tripwire actually refused — 0 on a healthy
+    night, 3 on the worst night this month. `yf.download` does not carry
+    corporate actions, so this is one extra request per symbol; doing it up
+    front for the whole ~1 150-symbol universe would not be affordable, and
+    that cost is the reason adjudication sits downstream of quarantine rather
+    than inside the merge.
+    """
+    try:
+        splits = yf.Ticker(symbol).splits
+    except Exception as exc:  # noqa: BLE001 - vendor errors are not our bug
+        print(f"WARN: could not read {symbol}'s action calendar ({exc})", file=sys.stderr)
+        return []
+    if splits is None or len(splits) == 0:
+        return []
+    actions: list[CorporateAction] = []
+    for ts, value in splits.items():
+        try:
+            ratio = float(value)
+        except (TypeError, ValueError):
+            continue
+        if ratio <= 0:
+            continue
+        effective = ts.date().isoformat() if hasattr(ts, "date") else str(ts)[:10]
+        actions.append(CorporateAction(symbol, effective, ratio))
+    return actions
+
+
+def _adjudicate(
+    refused_rows: dict[str, tuple], *, start: date, end: date
+) -> tuple[int, int]:
+    """Try to explain each symbol's refused rows by a real corporate action.
+
+    Returns ``(symbols_adjudicated, rows_explained)`` — explained, never
+    "still refused". The caller subtracts from the tripwire's own count, so
+    anything this function does not positively account for stays red. A
+    refused row whose detail never reached us (a MergeResult reporting a
+    count with no rows) must not be able to turn the run green by being
+    invisible: that is the "check that cannot fail" shape this repo keeps
+    paying for.
+
+    An explained symbol gets a scoped full-history re-merge with the tripwire
+    OFF, which accepts the new rows AND whatever back-history the vendor
+    restated as ONE decision. That is deliberate: the two limits are
+    asymmetric (a new row may move 40%, a revision only 20%), so a single
+    action could otherwise be half-ingested — JMAT.L's store took 08-13 at
+    +32% through the new-row door while its matching restatement of 08-12 was
+    refused, leaving the series straddling two bases. The asymmetry itself is
+    correct and is not being changed; what was missing is knowing the two
+    sides are one event.
+
+    Anything unexplained stays quarantined and the run still goes red. This
+    path can only ever turn a refusal into an ingest when the vendor's own
+    calendar says so.
+    """
+    if not refused_rows:
+        return 0, 0
+
+    already = _adjudicated_keys()
+    if already is None:
+        return 0, 0
+
+    adjudicated = 0
+    rows_explained = 0
+    for symbol in sorted(refused_rows):
+        rows = refused_rows[symbol]
+        calendar = _fetch_actions(symbol)
+        action = explain_quarantine(rows, calendar)
+        if action is None:
+            # Say WHICH of the two conditions failed. They call for different
+            # responses and the run's only other signal is a red X. The ratio
+            # case also degrades with time: a new row's ratio is measured
+            # against `latest_stored_close`, which is FROZEN for the length of
+            # the freeze, so the longer a symbol stays stuck the further the
+            # live price drifts from the implied ratio until no calendar entry
+            # can explain it any more. Silence there would read as "no
+            # corporate action" when it means "you left this too long".
+            if not calendar:
+                print(
+                    f"  ? {symbol}: {len(rows)} refused row(s), no corporate "
+                    "action on the vendor's calendar — left quarantined.",
+                    file=sys.stderr,
+                )
+            else:
+                observed = sorted({round(r.ratio, 4) for r in rows})
+                print(
+                    f"  ? {symbol}: {len(rows)} refused row(s) at ratio(s) "
+                    f"{observed} match no calendar action "
+                    f"{[(a.effective, round(a.price_ratio, 4)) for a in calendar]} "
+                    "— left quarantined.",
+                    file=sys.stderr,
+                )
+            continue
+        if (action.symbol, action.effective) in already:
+            # Already applied on an earlier run; the rows were refused again
+            # only because the store still carries the old basis. Re-merging
+            # is safe and idempotent, but the holdings must NOT move twice.
+            print(
+                f"  = {symbol}: {action.effective} action already adjudicated; "
+                "re-merging the store only.",
+                file=sys.stderr,
+            )
+            holders: list[str] = []
+        else:
+            holders = _apply_split_to_holders(symbol, action.shares_ratio)
+            _record_adjudication(action, holders, len(rows))
+            already.add((action.symbol, action.effective))
+
+        # The store side: re-fetch the full window and merge it with the
+        # tripwire OFF, revising from the window start so both the new rows
+        # and any restated history land together. Exactly what
+        # `--resweep --symbols <sym>` does — reused rather than reimplemented,
+        # so there is one rewrite path, not two.
+        df = _fetch_symbol(symbol, start, end)
+        if df is None:
+            print(
+                f"    (could not re-fetch {symbol}; store unchanged, "
+                "the action is recorded and will apply on the next run)",
+                file=sys.stderr,
+            )
+            continue
+        remerged = _write_rows(
+            symbol, df, revise_from=start.isoformat(), guard_anomalies=False
+        )
+        if not (remerged.appended or remerged.revised):
+            # The calendar explained the refusal but the re-merge landed
+            # nothing, so the store is STILL frozen on the pre-action close.
+            # Counting these rows as explained would drop `unadjudicated` to
+            # zero and exit 0 — and every later night would refuse the same
+            # rows, hit the `already` branch, and exit 0 again, making the
+            # freeze permanent AND invisible. That is exactly what the
+            # quarantine exit code exists to surface. Reachable: Yahoo serves
+            # a date over one window and not another, in both directions.
+            print(
+                f"    ({symbol}: re-merge wrote nothing — the store is still "
+                "frozen; leaving the rows refused so the run stays red)",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            instrument_status.clear(
+                symbol,
+                reason=f"adjudicated: {action.effective} corporate action, re-merged",
+            )
+        except instrument_status.RegistryUnreadable as exc:
+            print(
+                f"ERROR: instrument status registry unreadable ({exc}); "
+                f"{symbol} adjudicated but its status was not cleared.",
+                file=sys.stderr,
+            )
+        print(
+            f"  ! {symbol}: ADJUDICATED — {action.effective} corporate action, "
+            f"shares x{action.shares_ratio:.6g} (price x{action.price_ratio:.6g}), "
+            f"{len(rows)} refused row(s) accepted; store re-merged "
+            f"(+{remerged.appended} rows, ~{remerged.revised} revised)"
+            + (f"; adjusted {', '.join(holders)}" if holders else ""),
+            file=sys.stderr,
+        )
+        adjudicated += 1
+        rows_explained += len(rows)
+    return adjudicated, rows_explained
+
+
+def _warn_if_unheld(symbol: str, adjusted: list[str]) -> None:
+    """Say so when a real split touched nobody's book — only where one was applied.
+
+    Printed on the branches that actually attempted an adjustment. On the
+    ledger-skip branches nothing was attempted, and "no agent currently holds
+    X" there would read as a fact about the roster rather than as the reason
+    the holdings were left alone.
+    """
+    if not adjusted:
+        print(f"    (no agent currently holds {symbol})", file=sys.stderr)
+
+
+def _match_detected_split(symbol: str, ratio: float) -> CorporateAction | None:
+    """Find the calendar action a drift-inferred ratio corresponds to.
+
+    `detect_split` returns a bare ratio with no effective date, and the ledger
+    is keyed on (symbol, effective) — so the calendar is what lets a
+    drift-inferred detection share an identity with a calendar-adjudicated
+    one. Compared on `shares_ratio`, which is the convention `detect_split`
+    already returns (0.75 for JMAT.L's 3:4, not its 1.3333 price ratio).
+    """
+    for action in _fetch_actions(symbol):
+        if ratios_agree(ratio, action.shares_ratio):
+            return action
+    return None
+
+
+def _apply_split_to_holders(symbol: str, ratio: float) -> list[str]:
+    """Adjust every portfolio currently holding `symbol` for a detected split.
+
+    Prints one loud, clearly-marked line per adjusted agent — ticker, ratio,
+    agent, and before/after share count — so a detected split is visible in
+    the session/workflow log, not just a silent JSON mutation. No
+    confirmation step: safety here is the detector's own conservative
+    thresholds (engine.corporate_actions.detect_split), matching this
+    engine's existing "rails in code, not prompts" design — see the
+    Brain/Hands principle in CLAUDE.md.
+
+    Delayed import — engine.portfolio is not otherwise needed on this
+    script's hot path, and importing it at call time keeps test
+    monkeypatching of get_config().portfolios_dir respected.
+
+    Returns the agent_ids whose position was actually adjusted (a no-op for
+    any agent not holding the ticker).
+    """
+    from engine.portfolio import PortfolioManager
+
+    portfolios_dir = get_config().portfolios_dir
+    if not portfolios_dir.exists():
+        return []
+    manager = PortfolioManager(base_dir=portfolios_dir)
+    adjusted: list[str] = []
+    for portfolio_dir in sorted(portfolios_dir.iterdir()):
+        if not (portfolio_dir / "portfolio.json").exists():
+            continue
+        agent_id = portfolio_dir.name
+        before = next(
+            (p for p in manager.load(agent_id).positions if p.ticker == symbol), None
+        )
+        if before is None:
+            continue
+        if not manager.apply_split(agent_id, symbol, ratio):
+            continue
+        after = next(p for p in manager.load(agent_id).positions if p.ticker == symbol)
+        print(
+            f"    [SPLIT ADJUSTED] agent={agent_id} ticker={symbol} "
+            f"ratio={ratio:.4f} shares {before.shares:.4f} -> {after.shares:.4f} "
+            f"avg_cost {before.avg_cost:.4f} -> {after.avg_cost:.4f}",
+            file=sys.stderr,
+        )
+        adjusted.append(agent_id)
+    return adjusted
+
+
+def _store_gaps_path() -> Path:
+    """The ledger of held store gaps (`engine.store_gaps`).
+
+    Beside the store and under the same push gate, for `_ledger_path`'s
+    reason. It is what keeps a gap from ageing out of the lookback into a
+    false "Recovered": an entry leaves only when the store holds its date.
+    """
+    return get_config().data_dir / "data" / "market" / "store_gaps.json"
+
+
+class StoreGapReport(NamedTuple):
+    #: symbol -> {date: reason}: in-scope gaps the refetch could not close.
+    open: dict[str, dict[str, str]]
+    #: Rows inserted into the store from the refetch.
+    filled: int
+    #: Rows the tripwire refused on the way in. Held in the ledger for a
+    #: human, NOT handed to `_adjudicate`: its explained branch re-merges two
+    #: years of history with the tripwire off, and this pass only ever adds.
+    quarantined: int
+    #: False when the ledger could not be read. Never green: the held gaps
+    #: it carries are unknown, and it is left untouched rather than rewritten.
+    ledger_readable: bool
+
+
+def _served_closes(df: pd.DataFrame | None) -> dict[str, bool | None] | None:
+    """date -> True (a close), False (no close, some volume), None (a null row).
+
+    See `engine.store_gaps.verdict`.
+    """
+    if df is None or "Close" not in df.columns:
+        return None
+    volume = df["Volume"] if "Volume" in df.columns else pd.Series(0, index=df.index)
+    return {
+        ts.date().isoformat(): (
+            True if pd.notna(close) else (None if _is_null_row(close, vol) else False)
+        )
+        for ts, close, vol in zip(df.index, df["Close"], volume)
+    }
+
+
+def _heal_store_gaps(
+    scope: set[str], end: date, crypto: frozenset[str], *, full_universe: bool = False
+) -> StoreGapReport:
+    """Find the trading days the STORED series skips, refetch them, hold the rest.
+
+    Follow-up money review r6, I1 — see `engine.store_gaps` for the rule.
+    Everything the refetch inserts is a date the store does not hold, merged
+    with revision off, so no stored row can change: the pass only ever adds.
+    The tripwire stays on, because a unit flip in an old row is as costly as
+    one in tonight's.
+    """
+    ohlcv_dir = get_config().ohlcv_dir
+    stored = {p.stem: frozenset(_existing_dates(p)) for p in sorted(ohlcv_dir.glob("*.jsonl"))}
+    scope = {s for s in scope if stored.get(s)}
+    start = lookback_start(end)
+    scan = scan_store(
+        stored,
+        bucket_of=lambda s: hole_bucket(s, crypto),
+        scope=scope,
+        start=start.isoformat(),
+        end=end.isoformat(),
+    )
+
+    # Every symbol the universe still names, for closing out a departed
+    # symbol's entries. Taken before `scope` is narrowed to stored symbols.
+    universe = set(scope)
+    ledger_path = _store_gaps_path()
+    held: dict[str, dict[str, str]] = {}
+    readable = True
+    if ledger_path.exists():
+        try:
+            held = parse_ledger(ledger_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            readable = False
+            print(
+                f"\nERROR: the store-gap ledger at {ledger_path} is unreadable "
+                f"({exc}). The gaps it holds are unknown, so this run cannot be "
+                "green; the file is left as it is for a human to repair.",
+                file=sys.stderr,
+            )
+
+    # A gap whose refetched row the tripwire refused waits for a human: a
+    # quarantine is adjudicated, never waved through because a later night's
+    # refetch happens to pass — and re-asking nightly would only append the
+    # same refusal to the quarantine file again.
+    for_a_human = {
+        (symbol, d)
+        for symbol, gaps in held.items()
+        if symbol in scope
+        for d, reason in gaps.items()
+        if reason == "quarantined" and d not in stored[symbol]
+    }
+    # A gap a human accepted as unfillable, with a reason on record, is green:
+    # never refetched and never re-opened by the scan, however long it stays
+    # inside the lookback. It leaves the ledger only once the store holds it.
+    accepted = {
+        (symbol, d): entry
+        for symbol, gaps in held.items()
+        if symbol in scope
+        for d, entry in gaps.items()
+        if is_accepted(entry) and d not in stored[symbol]
+    }
+    settled = for_a_human | set(accepted)
+    candidates: dict[str, set[str]] = {s: set(ds) for s, ds in scan.member_gaps.items()}
+    for symbol, gaps in held.items():
+        if symbol in scope:
+            missing = {d for d in gaps if d not in stored[symbol]}
+            if missing:
+                candidates.setdefault(symbol, set()).update(missing)
+    for symbol, d in settled:
+        candidates.get(symbol, set()).discard(d)
+
+    # Every date a symbol may be asked about, so each is fetched ONCE, over a
+    # window opening HEAL_WINDOW_DAYS before the oldest of them: wide, because
+    # the one-day window is the request shape that missed, and reaching BEFORE
+    # the date, because "not traded" needs the vendor's series on both sides
+    # of it (a window starting on the date read 2026-05-01, May Day, as
+    # unfetched).
+    asked: dict[str, set[str]] = {s: set(ds) for s, ds in candidates.items()}
+    bucket_candidates = {
+        key: unsettled
+        for key, lacking in scan.bucket_candidates.items()
+        if (unsettled := tuple(s for s in lacking if (s, key[1]) not in settled))
+    }
+    for (_, d), lacking in bucket_candidates.items():
+        for symbol in lacking:
+            asked.setdefault(symbol, set()).add(d)
+    frames: dict[str, pd.DataFrame | None] = {}
+    served: dict[str, dict[str, bool] | None] = {}
+
+    intraday: dict[str, dict[str, float] | None] = {}
+
+    def judge(symbol: str, d: str) -> Verdict:
+        """`verdict`, with a null row settled by the symbol's own 1h bars."""
+        v = verdict(serve(symbol), d)
+        if v is not Verdict.UNDECIDED:
+            return v
+        if symbol not in intraday:
+            intraday[symbol] = _fetch_intraday_volume(symbol, end)
+        traded = intraday_traded(intraday[symbol], d)
+        if traded is None:
+            return Verdict.UNFETCHED
+        return Verdict.NO_CLOSE if traded else Verdict.NOT_TRADED
+
+    def serve(symbol: str) -> dict[str, bool | None] | None:
+        if symbol not in frames:
+            oldest = date.fromisoformat(min(asked[symbol]))
+            window_start = oldest - timedelta(days=HEAL_WINDOW_DAYS)
+            frames[symbol] = _fetch_symbol(symbol, window_start, end)
+            served[symbol] = _served_closes(frames[symbol])
+        return served[symbol]
+
+    # A date the bucket lacks wholesale: a holiday or a hole. The best-covered
+    # members are asked first; a closed day is one their series runs across.
+    closed: list[str] = []
+    undecided: list[str] = []
+    for (bucket, d), lacking in bucket_candidates.items():
+        probes = lacking[:PROBE_SIZE]
+        traded = bucket_traded([judge(s, d) for s in probes])
+        if traded is False:
+            closed.append(f"{bucket or 'US'} {d}")
+            continue
+        if traded is None:
+            # No probe could be asked: the vendor is unavailable, which says
+            # nothing about the date. It is held, on the probes alone, rather
+            # than fanned out to every lacking member: that was 579 wide
+            # requests for US Labor Day and 719 `unfetched` entries with the
+            # vendor down, inside a job whose cancellation files no issue
+            # (follow-up review r8, r4 M1). The next night re-probes.
+            undecided.append(f"{bucket or 'US'} {d}")
+            for symbol in probes:
+                candidates.setdefault(symbol, set()).add(d)
+            continue
+        for symbol in lacking:
+            candidates.setdefault(symbol, set()).add(d)
+
+    open_gaps: dict[str, dict[str, str]] = {}
+    for symbol, d in sorted(for_a_human):
+        open_gaps.setdefault(symbol, {})[d] = "quarantined"
+    filled_by_date: dict[str, int] = {}
+    not_traded = 0
+    quarantined = 0
+    # Revision is off for the refetch: past `end`, so no stored date is on or
+    # after it. Every row handed over is one the store lacks, and merge_rows
+    # appends those after the existing lines, which it rewrites verbatim.
+    no_revision = (end + timedelta(days=1)).isoformat()
+    for symbol in sorted(candidates):
+        verdicts = {d: judge(symbol, d) for d in sorted(candidates[symbol])}
+        for d, v in verdicts.items():
+            if v in OPEN_VERDICTS:
+                # Evidence is never downgraded: once the vendor has served the
+                # date as a trading day with no close, one empty refetch must
+                # not rewrite it `unfetched`, which a later "not traded" would
+                # clear green (follow-up review r8; r5 M1, r6 N-M1).
+                held_reason = held.get(symbol, {}).get(d)
+                keep = held_reason == Verdict.NO_CLOSE.value
+                open_gaps.setdefault(symbol, {})[d] = held_reason if keep else v.value
+            elif (
+                v is Verdict.NOT_TRADED
+                and held.get(symbol, {}).get(d) == Verdict.NO_CLOSE.value
+            ):
+                # The vendor already served this date as a trading day (with
+                # no close). A later series that omits it is the request-shape
+                # inconsistency in the other direction, not a holiday: the
+                # gap stays held (follow-up review r7; r2 M-1, r3 M1).
+                open_gaps.setdefault(symbol, {})[d] = Verdict.NO_CLOSE.value
+            elif v is Verdict.NOT_TRADED:
+                not_traded += 1
+        fill = {d for d, v in verdicts.items() if v is Verdict.FILLED}
+        if not fill:
+            continue
+        df = frames[symbol]
+        rows = df[[ts.date().isoformat() in fill for ts in df.index]]
+        merged = _write_rows(symbol, rows, no_revision, guard_anomalies=True)
+        for d in fill - {r.date for r in merged.refused}:
+            filled_by_date[d] = filled_by_date.get(d, 0) + 1
+        if merged.refused:
+            quarantined += merged.quarantined
+            for row in merged.refused:
+                open_gaps.setdefault(symbol, {})[row.date] = "quarantined"
+
+    if readable:
+        kept = {s: dict(gaps) for s, gaps in held.items() if s not in scope}
+        if full_universe:
+            # Only a full-universe run knows a symbol has LEFT (a crypto-only
+            # or targeted run's scope is narrower by design, and leaves the
+            # rest alone). A departed symbol is never fetched again, so its
+            # entries would park an open gap in silence for good (follow-up
+            # review r7, r2 M-2): they are closed out, and the log says why.
+            for symbol in sorted(s for s in kept if s not in universe):
+                gaps = kept.pop(symbol)
+                print(
+                    f"Store-gap ledger: closed out {symbol} ({', '.join(sorted(gaps))}): "
+                    "the symbol has left the universe and no book holds it, so no "
+                    "run will fetch it again. Its store file keeps the gap."
+                )
+        for (symbol, d), entry in accepted.items():
+            kept.setdefault(symbol, {})[d] = entry
+        for symbol, gaps in open_gaps.items():
+            kept.setdefault(symbol, {}).update(gaps)
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        ledger_path.write_text(render_ledger(kept), encoding="utf-8")
+
+    filled = sum(filled_by_date.values())
+    print(
+        f"\nStore gaps (last {GAP_LOOKBACK_TRADING_DAYS} trading days, from "
+        f"{start}): filled {filled} row(s) from the vendor"
+        + (
+            " (" + ", ".join(f"{d}: {n}" for d, n in sorted(filled_by_date.items())) + ")"
+            if filled_by_date
+            else ""
+        )
+        + f"; {not_traded} date(s) the vendor's own series skips (not traded)"
+        + (f"; {quarantined} refused by the ingest tripwire, held" if quarantined else "")
+        + (f"; {len(accepted)} accepted as unfillable, green" if accepted else "")
+        + (f"; closed: {', '.join(closed)}" if closed else "")
+        + (f"; undecided (probe failed, held): {', '.join(undecided)}" if undecided else "")
+        + "."
+    )
+    if open_gaps:
+        by_date: dict[str, list[str]] = {}
+        for symbol, gaps in open_gaps.items():
+            for d in gaps:
+                by_date.setdefault(d, []).append(symbol)
+        listed = "; ".join(
+            f"{d} ({len(syms)} symbol(s): {', '.join(sorted(syms)[:5])}"
+            + ("…" if len(syms) > 5 else "")
+            + ")"
+            for d, syms in sorted(by_date.items())
+        )
+        print(
+            f"\nFAILED: store gap — the stored series still skips a trading day "
+            f"after a refetch reaching {HEAL_WINDOW_DAYS} days before it: {listed}. Held "
+            f"in {ledger_path.name}; this run stays red until the store holds "
+            "each date, so a later night cannot close the issue on a store "
+            "that still lacks it. `no-close` is a date the vendor serves "
+            "without a price; `unfetched` is one it cannot be asked about "
+            "(no data, or only today's quote); `quarantined` is one the ingest "
+            "tripwire refused. Each needs a human.",
+            file=sys.stderr,
+        )
+    return StoreGapReport(open_gaps, filled, quarantined, readable)
+
+
+#: The settlement window the shadow measures, in weekdays (plan: Stage 2,
+#: subtask 2.2). A proposal under measurement, not a policy: nothing but
+#: `--settlement-shadow` reads it.
+SETTLEMENT_WINDOW_BDAYS = 10
+
+#: Exit when the shadow could not form a view at all (nothing served). Not 0:
+#: an empty report is "unknown", never "nothing would change".
+EXIT_SHADOW_NO_DATA = 2
+
+
+def settlement_window_start(end: date, bdays: int = SETTLEMENT_WINDOW_BDAYS) -> date:
+    """The date `bdays` weekdays before `end` (weekends skipped, holidays not)."""
+    day = end
+    remaining = bdays
+    while remaining > 0:
+        day -= timedelta(days=1)
+        if day.weekday() < 5:
+            remaining -= 1
+    return day
+
+
+def shadow_merge(path: Path, df: pd.DataFrame, revise_from: str) -> dict:
+    """What `merge_rows` WOULD do to the store file at `path`, without doing it.
+
+    Runs the real `merge_rows` (tripwire on) against a throwaway copy, so the
+    shadow can never drift from the logic it is measuring and can never write
+    the store, the quarantine sidecar or a `.tmp` orphan. Returns the dates it
+    would insert, the rows it would revise (old and new close), the rows the
+    tripwire would refuse, and the dates served with no close.
+    """
+    before = {r.get("date"): r for r in _read_store_rows(path)}
+    with tempfile.TemporaryDirectory(prefix="settlement-shadow-") as tmp:
+        scratch = Path(tmp) / path.name
+        shutil.copyfile(path, scratch)
+        result = merge_rows(
+            scratch, df, revise_from, quarantine=Path(tmp) / "quarantine.jsonl"
+        )
+        after = {r.get("date"): r for r in _read_store_rows(scratch)}
+    inserts = sorted(d for d in after if d not in before)
+    revisions = [
+        {
+            "date": d,
+            "old_close": before[d].get("close"),
+            "new_close": after[d].get("close"),
+        }
+        for d in sorted(after)
+        if d in before and after[d] != before[d]
+    ]
+    return {
+        "inserts": inserts,
+        "revisions": revisions,
+        "quarantined": [r._asdict() for r in result.refused],
+        "holes": list(result.holes),
+    }
+
+
+def run_settlement_shadow(symbols: list[str], end: date, out_dir: Path) -> int:
+    """Request `[end - window, end]` for every store-covered symbol and report.
+
+    READ-ONLY with respect to the store, the ledgers and git: it writes one
+    JSON file under `out_dir` (gitignored, uploaded as a workflow artifact) and
+    nothing else. A symbol with no store file is counted and skipped, because
+    its first ingest is a different code path the window does not change.
+    """
+    start = settlement_window_start(end)
+    ohlcv_dir = get_config().ohlcv_dir
+    report: dict = {
+        "end": end.isoformat(),
+        "window_start": start.isoformat(),
+        "window_bdays": SETTLEMENT_WINDOW_BDAYS,
+        # Provenance, so a night's report names the main it measured and the
+        # run that produced it; the comparison needs no hand-built --base.
+        # Absent outside Actions.
+        "base_sha": os.environ.get("GITHUB_SHA"),
+        "run_id": os.environ.get("GITHUB_RUN_ID"),
+        "event": os.environ.get("GITHUB_EVENT_NAME"),
+        "requested": len(symbols),
+        "skipped_no_store": [],
+        "failed": [],
+        "served": 0,
+        "inserts": {},
+        "revisions": {},
+        "quarantined": [],
+        "holes": {},
+    }
+    for i, symbol in enumerate(symbols, start=1):
+        path = ohlcv_dir / f"{symbol}.jsonl"
+        if not path.exists():
+            report["skipped_no_store"].append(symbol)
+            continue
+        df = _fetch_symbol(symbol, start, end)
+        if df is None:
+            report["failed"].append(symbol)
+            continue
+        report["served"] += 1
+        outcome = shadow_merge(path, df, start.isoformat())
+        if outcome["inserts"]:
+            report["inserts"][symbol] = outcome["inserts"]
+        if outcome["revisions"]:
+            report["revisions"][symbol] = outcome["revisions"]
+        if outcome["quarantined"]:
+            report["quarantined"].extend(outcome["quarantined"])
+        if outcome["holes"]:
+            report["holes"][symbol] = outcome["holes"]
+        if i % 100 == 0:
+            print(f"  shadow: {i}/{len(symbols)} symbols", file=sys.stderr)
+    report["totals"] = {
+        "inserts": sum(len(v) for v in report["inserts"].values()),
+        "revisions": sum(len(v) for v in report["revisions"].values()),
+        "quarantined": len(report["quarantined"]),
+        "failed": len(report["failed"]),
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{date.today().isoformat()}.json"
+    out.write_text(json.dumps(report, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    print(
+        f"Settlement shadow: window {start}..{end}, served {report['served']}, "
+        f"would insert {report['totals']['inserts']}, revise "
+        f"{report['totals']['revisions']}, quarantine "
+        f"{report['totals']['quarantined']}, failed {report['totals']['failed']} "
+        f"-> {out}"
+    )
+    if report["served"] == 0:
+        print("::warning::settlement shadow served no symbol; report is UNKNOWN", file=sys.stderr)
+        return EXIT_SHADOW_NO_DATA
+    asked = report["served"] + len(report["failed"])
+    if len(report["failed"]) / asked > MAX_FAILURE_RATE:
+        print(
+            f"::warning::settlement shadow fetch failed for {len(report['failed'])} of {asked} "
+            f"symbols (limit {MAX_FAILURE_RATE:.0%}); report is UNKNOWN",
+            file=sys.stderr,
+        )
+        return EXIT_SHADOW_NO_DATA
+    return 0
+
+
+def _universe_is_complete(args: argparse.Namespace) -> bool:
+    """Whether this run's scope is the whole universe, resolved without error.
+
+    A targeted or crypto-only run's scope is narrow by design. A full run whose
+    universe resolution swallowed an error is narrow by accident, and says so.
+    """
+    if args.symbols or args.crypto_only or args.close_run:
+        return False
+    if _resolver_failures:
+        print(
+            f"WARN: universe resolution failed for {', '.join(_resolver_failures)}; "
+            "no store-gap ledger entry is closed out this run.",
+            file=sys.stderr,
+        )
+    return _resolver_failures == []
+
+
+def _accept_gap(parser: argparse.ArgumentParser, target: str, reason: str | None) -> int:
+    """``--accept-gap SYMBOL:DATE --reason TEXT``: record a human's acceptance.
+
+    Refuses an empty reason (an acceptance nobody can explain is not a
+    decision), a date the store already holds, and an unreadable ledger,
+    which it never overwrites.
+    """
+    if reason is None or not reason.strip():
+        parser.error("--accept-gap requires a non-empty --reason")
+    symbol, _, day = target.rpartition(":")
+    try:
+        accepted_on = date.today()
+        when = date.fromisoformat(day)
+    except ValueError:
+        parser.error(f"--accept-gap expects SYMBOL:YYYY-MM-DD, got {target!r}")
+    path = get_config().ohlcv_dir / f"{symbol}.jsonl"
+    if not symbol or not path.exists():
+        parser.error(f"--accept-gap: the store has no file for {symbol!r}")
+    if when.isoformat() in _existing_dates(path):
+        parser.error(
+            f"--accept-gap: the store already holds {when} for {symbol}; there "
+            "is no gap to accept"
+        )
+    ledger_path = _store_gaps_path()
+    held: dict = {}
+    if ledger_path.exists():
+        try:
+            held = parse_ledger(ledger_path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            parser.error(f"--accept-gap: the ledger at {ledger_path} is unreadable ({exc})")
+    held.setdefault(symbol, {})[when.isoformat()] = accepted_entry(reason, accepted_on)
+    ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    ledger_path.write_text(render_ledger(held), encoding="utf-8")
+    print(f"Accepted the {symbol} gap on {when}: {reason.strip()}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--history-days",
+        type=int,
+        default=730,
+        help="Days of history to fetch on first run (default 730 ≈ 2 years)",
+    )
+    parser.add_argument(
+        "--symbols",
+        type=str,
+        default=None,
+        help="Comma-separated override list (skip universe resolution)",
+    )
+    parser.add_argument(
+        "--crypto-only",
+        action="store_true",
+        help="Restrict to crypto pairs (weekend fetch — crypto trades 24/7)",
+    )
+    parser.add_argument(
+        "--close-run",
+        choices=("eu", "us"),
+        default=None,
+        help=(
+            "Same-evening pass over ONE cash-equity bucket, asking the vendor "
+            "for TODAY's close: `eu` is every exchange suffix in "
+            "EU_CLOSE_SUFFIXES, `us` every US listing (no suffix; crypto, FX "
+            "and futures excluded). Dispatched by the Cloudflare Worker after "
+            "that bucket's markets close; the morning run keeps its "
+            "previous-day rule for everything else. See `close_run_bucket`."
+        ),
+    )
+    parser.add_argument(
+        "--settlement-shadow",
+        action="store_true",
+        help=(
+            "READ-ONLY measurement for the settlement-window proposal: request "
+            "the last SETTLEMENT_WINDOW_BDAYS weekdays for every store-covered "
+            "symbol and write what merge_rows (tripwire on) WOULD insert or "
+            "revise to data/market/settlement_shadow/YYYY-MM-DD.json. Never "
+            "touches the store, the quarantine, the ledgers or git. Run by the "
+            "`settlement-shadow` job in fetch-ohlcv.yml, after the real fetch."
+        ),
+    )
+    parser.add_argument(
+        "--shadow-end",
+        metavar="YYYY-MM-DD",
+        type=date.fromisoformat,
+        default=None,
+        help=(
+            "With --settlement-shadow only: the `end` the real fetch job used, "
+            "so both jobs measure the same window even when a dispatched run "
+            "crosses 00:00 UTC between them. Default: yesterday. Must be "
+            "before today, never a still-forming bar."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="List symbols without fetching"
+    )
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help=(
+            "Force a full re-fetch of the --history-days window for every "
+            "symbol, ignoring existing rows. Used once to deepen the OHLCV "
+            "store; new rows are deduped against existing dates so this is "
+            "idempotent."
+        ),
+    )
+    parser.add_argument(
+        "--resweep",
+        action="store_true",
+        help=(
+            "Re-fetch the full --history-days window AND allow every row in it to "
+            "be revised. Corrects partial bars frozen anywhere in history, unlike "
+            "--backfill which re-fetches but writes append-only. Requires an "
+            "explicit --symbols list: it rewrites committed history. Also the "
+            "path that runs corporate-action (stock split) detection — see "
+            "engine.corporate_actions — since that needs a genuine historical "
+            "overlap the 1-day incremental revision window can't provide."
+        ),
+    )
+    parser.add_argument(
+        "--resweep-held",
+        action="store_true",
+        help=(
+            "Convenience form of --resweep, scoped automatically to every "
+            "ticker currently held across all portfolios (via "
+            "_collect_holdings()) instead of a hand-maintained --symbols "
+            "list. This is the scheduled trigger for split detection: a real "
+            "split only matters at all for a ticker some agent actually "
+            "holds, and that set is small (on the order of 30 symbols) — "
+            "cheap enough to resweep on a schedule. Mutually exclusive with "
+            "--symbols (it resolves its own) and --backfill."
+        ),
+    )
+    parser.add_argument(
+        "--names-only",
+        action="store_true",
+        help=(
+            "Skip OHLCV download — only refresh the data/tickers.json "
+            "registry. Used for the one-time bootstrap and for cheap "
+            "re-runs after a universe change."
+        ),
+    )
+    parser.add_argument(
+        "--accept-gap",
+        metavar="SYMBOL:DATE",
+        default=None,
+        help=(
+            "Mark one store gap as accepted in data/market/store_gaps.json, "
+            "with a required --reason, then exit without fetching. An accepted "
+            "gap is green and never re-opened. It is for a date that cannot be "
+            "filled insert-only, e.g. a vendor row on another split basis."
+        ),
+    )
+    parser.add_argument(
+        "--reason",
+        default=None,
+        help="Why the --accept-gap date cannot be filled. Required with it.",
+    )
+    args = parser.parse_args()
+
+    if args.settlement_shadow and (
+        args.symbols
+        or args.crypto_only
+        or args.close_run
+        or args.resweep
+        or args.resweep_held
+        or args.backfill
+        or args.names_only
+        or args.dry_run
+        or args.accept_gap is not None
+        or args.reason is not None
+    ):
+        parser.error(
+            "--settlement-shadow measures the full universe on its own; it "
+            "cannot be combined with any other mode"
+        )
+
+    if args.accept_gap is not None:
+        return _accept_gap(parser, args.accept_gap, args.reason)
+    if args.reason is not None:
+        parser.error("--reason is only used with --accept-gap")
+
+    if args.resweep and not args.symbols and not args.resweep_held:
+        parser.error("--resweep requires an explicit --symbols list")
+    if args.resweep and args.backfill:
+        parser.error("--resweep and --backfill are mutually exclusive")
+    if args.resweep_held and args.symbols:
+        parser.error(
+            "--resweep-held resolves its own --symbols list — do not pass both"
+        )
+    if args.resweep_held and args.backfill:
+        parser.error("--resweep-held and --backfill are mutually exclusive")
+    if args.close_run and (
+        args.symbols
+        or args.crypto_only
+        or args.resweep
+        or args.resweep_held
+        or args.backfill
+        or args.names_only
+    ):
+        parser.error(
+            "--close-run resolves its own bucket and asks for today's bar; it "
+            "cannot be combined with --symbols, --crypto-only, --resweep, "
+            "--resweep-held, --backfill or --names-only"
+        )
+
+    if args.shadow_end is not None:
+        if not args.settlement_shadow:
+            parser.error("--shadow-end is only used with --settlement-shadow")
+        if args.shadow_end >= date.today():
+            parser.error("--shadow-end must be before today (a bar still forming)")
+
+    # Only THIS run's resolution may license a close-out (`_resolver_failures`).
+    global _resolver_failures
+    _resolver_failures = None
+    if args.symbols:
+        symbols = sorted({s.strip() for s in args.symbols.split(",") if s.strip()})
+    elif args.resweep_held:
+        symbols = sorted(_collect_holdings())
+        # Reuses the exact --resweep code path below (full-window revise_from
+        # + split detection) — the only difference is how `symbols` got
+        # resolved.
+        args.resweep = True
+        if not symbols:
+            print("No open positions across any portfolio — nothing to resweep.")
+            return 0
+    elif args.crypto_only:
+        symbols = _crypto_symbols()
+    elif args.close_run:
+        crypto_set = frozenset(_crypto_symbols())
+        symbols = [
+            s for s in _all_symbols() if close_run_bucket(s, crypto_set) == args.close_run
+        ]
+    else:
+        symbols = _all_symbols()
+
+    print(f"Resolved {len(symbols)} symbols to fetch.")
+    if args.settlement_shadow:
+        return run_settlement_shadow(
+            symbols,
+            args.shadow_end or date.today() - timedelta(days=1),
+            get_config().data_dir / "data" / "market" / "settlement_shadow",
+        )
+    if args.dry_run:
+        for s in symbols:
+            print(f"  {s}")
+        return 0
+
+    # The MORNING run never asks for today (2026-08-12). `end` is the newest
+    # day this run will ask the vendor for, and asking for today is asking for
+    # a bar that is still forming. On a cash market that costs nothing — the
+    # day has not opened, so the vendor returns nothing — but a 24/7 instrument
+    # (crypto, FX, and futures on Globex) is served a partial bar the moment
+    # the UTC day opens. Measured on 2026-08-12: Yahoo returns a same-day
+    # BTC-USD close at 07:49 UTC. Under the 06:00 cron that row is roughly six
+    # hours old, the evening session publishes it, and
+    # `PortfolioManager.add_snapshot` then freezes it — the next morning's
+    # revision arrives too late to move the published mark. Under the old
+    # 22:30 cron the same row was ~22.5 h formed, which was wrong more cheaply
+    # rather than right. Ending at yesterday means every row the morning run
+    # stores is a COMPLETE daily bar, on every instrument.
+    #
+    # A CLOSE RUN asks for today (2026-09-28), for one cash-equity bucket
+    # whose markets have all closed by the hour it is dispatched — see
+    # `close_run_bucket` for the vendor behaviour that makes the evening the
+    # only hour a day's close is reliably served. Its bar is complete by
+    # construction (the bell has rung), and the 22:00 UTC session then prices
+    # the day it is running on: the snapshot it publishes is dated on the
+    # session's own day, where the morning-only regime dated it on the
+    # previous one (the 08-04 session published 08-03). Crypto, FX and futures
+    # keep the previous-day rule, so their mark stays a completed bar.
+    if args.close_run:
+        end = date.today()
+    else:
+        end = date.today() - timedelta(days=1)
+
+    # Universal 1-day revision window: re-request the trailing stored day and
+    # let its final value replace it.
+    #
+    # It no longer catches PARTIAL bars — with `end` at yesterday nothing
+    # partial is ever stored. What it catches now is a genuine vendor
+    # revision of an already-complete bar, which is real and measurable:
+    # `GC=F`/`PL=F`/`CL=F` each moved on 13 of 22 shared days (up to +3.4%)
+    # and FX on 5 of 23 (worst -1.56%) when that was measured under the 22:30
+    # schedule. Yahoo also restates raw `close` outright for a corporate
+    # action, which is what `detect_split` adjudicates on the weekly resweep.
+    #
+    # For a bar the vendor does not revise, the re-fetch is identical,
+    # `merge_rows` finds nothing to replace, and no already-stored row changes
+    # value or position. (The file is still rewritten to append the day's new
+    # bar, and a genuine revision does rewrite it — what is invariant is the
+    # stored rows, not the file's mtime.) So a blanket window adds no churn
+    # and needs no instrument taxonomy to maintain as universes grow.
+    revise_days = 1
+
+    registry_updates: dict[str, dict] = {}
+    # The vendor-name registry is refreshed by the morning run, once a day
+    # for every symbol (one info request each). A close run only re-reads the
+    # names of symbols it ingests for the FIRST time, where the vendor's unit
+    # decides the scale; re-asking ~600 names a second and third time a day
+    # would double the request volume for nothing.
+    refresh_names = not args.close_run
+    #: exchange suffix -> [symbols whose frame carried `end`'s close, symbols
+    #: served], on a close run. Reported, never an exit code — see
+    #: `_report_close_run_reach`.
+    reached_by_exchange: dict[str, list[int]] = {}
+
+    total_new = 0
+    total_revised = 0
+    total_quarantined = 0
+    #: symbol -> the rows the tripwire refused this run, for adjudication.
+    refused_rows: dict[str, tuple] = {}
+    # Split by whether the store already covers the symbol — see the exit path.
+    # `considered_covered` counts every covered symbol the run formed a view on,
+    # including those skipped as already-current: they are evidence the store is
+    # healthy, and dropping them collapses the denominator.
+    considered_covered = 0
+    holes_by_date: dict[str, int] = {}
+    # The same two counts per exchange suffix, for `exchange_wide_holes`.
+    covered_by_exchange: dict[str, int] = {}
+    holes_by_exchange: dict[str, dict[str, int]] = {}
+    # The crypto-only mode's own set, so a pair the fee allowlist does not
+    # carry (HBAR-USD) still rates as crypto. Read from committed universe
+    # files; no network.
+    crypto_bucket = frozenset() if args.names_only else frozenset(_crypto_symbols())
+    covered_failures = 0
+    unresolved: list[str] = []
+    served = 0
+    splits_detected = 0
+    for i, symbol in enumerate(symbols, start=1):
+        if not args.names_only:
+            path = get_config().ohlcv_dir / f"{symbol}.jsonl"
+            revise_from: str | None = None
+
+            if args.resweep:
+                start = end - timedelta(days=args.history_days)
+                revise_from = start.isoformat()
+            elif args.backfill:
+                start = end - timedelta(days=args.history_days)
+            else:
+                existing = _existing_dates(path) if path.exists() else set()
+                last = (
+                    max(datetime.fromisoformat(d).date() for d in existing)
+                    if existing
+                    else None
+                )
+                window_start = fetch_window_start(
+                    last, end, args.history_days, revise_days=revise_days
+                )
+                if window_start is None:
+                    if refresh_names:
+                        registry_updates[symbol] = resolve_name(
+                            symbol, _fetch_ticker_info(symbol)
+                        )
+                    # A symbol the store already carries through `end` is
+                    # evidence the store is healthy, so it belongs in the
+                    # gate's denominator even though nothing was requested for
+                    # it. Skipping it here collapses that denominator onto the
+                    # handful of permanently-dead names that ARE still
+                    # attempted (their store is stale, so they never take this
+                    # branch) — MATIC-USD and UNI-USD alone read 2/2 = 100%
+                    # and fail a fully current store. Reachable whenever most
+                    # symbols are already up to date: a second run in one UTC
+                    # day, or the Tue-Sat full run (`0 6 * * 2-6`) delayed past
+                    # midnight into Sunday — its `end` is then Saturday, so it
+                    # writes the Saturday rows for the 24/7 names before the
+                    # Sun-Mon crypto-only run (`0 6 * * 0,1`), whose `end` is
+                    # also Saturday, asks for them.
+                    if path.exists():
+                        considered_covered += 1
+                        ex = hole_bucket(symbol, crypto_bucket)
+                        covered_by_exchange[ex] = covered_by_exchange.get(ex, 0) + 1
+                    continue  # OHLCV already up to date; still refresh name
+                start = window_start
+                if revise_days and last is not None:
+                    revise_from = start.isoformat()
+
+            # Whether the store already covers this symbol decides which
+            # population its failure belongs to, and it has to be read before
+            # the write below creates the file.
+            covered = path.exists()
+            if covered:
+                considered_covered += 1
+                ex = hole_bucket(symbol, crypto_bucket)
+                covered_by_exchange[ex] = covered_by_exchange.get(ex, 0) + 1
+
+            # A FIRST ingest is scaled by whatever the vendor says the symbol
+            # quotes in, not by the suffix heuristic: the registry (currency
+            # layer 2) has no entry yet — it is written after this loop — and
+            # the heuristic calls every `.L` line pence, which would store a
+            # USD- or EUR-quoted London name (Compass, IHG, Metlen) at 1/100
+            # permanently. The info is fetched once and reused for the name.
+            vendor_unit: str | None = None
+            if not covered:
+                registry_updates[symbol] = resolve_name(symbol, _fetch_ticker_info(symbol))
+                vendor_unit = registry_updates[symbol].get("currency")
+
+            df = _fetch_symbol(symbol, start, end, vendor_unit=vendor_unit)
+            if df is None:
+                if covered:
+                    covered_failures += 1
+                    # A covered symbol that served NOTHING did not advance to
+                    # `end` either. The aggregate rates it as a failure, over
+                    # the whole universe; per bucket it is a hole on `end`,
+                    # or an exchange that went dark reads ~6% and passes
+                    # (follow-up money review r3, M5). A closed exchange is
+                    # not this: the one-day revision window re-requests the
+                    # last stored day, so a holiday still serves a frame.
+                    by_date = holes_by_exchange.setdefault(
+                        hole_bucket(symbol, crypto_bucket), {}
+                    )
+                    by_date[end.isoformat()] = by_date.get(end.isoformat(), 0) + 1
+                else:
+                    unresolved.append(symbol)
+            else:
+                served += 1
+                # Split detection needs a genuinely historical overlap between
+                # what's already stored and what was just re-fetched — only
+                # --resweep re-requests the full history window against
+                # already-committed rows still due to be revised. The
+                # universal 1-day revision window (revise_from set below,
+                # every run) overlaps on exactly one trailing date, which
+                # detect_split's own "at least a handful of rows" gate
+                # already refuses on its own; gating on --resweep here avoids
+                # the wasted store re-read on every symbol, every night, for
+                # a comparison that structurally cannot fire.
+                if args.resweep:
+                    stored_rows = _read_store_rows(path)
+                    ratio = detect_split(stored_rows, df)
+                    if ratio is not None:
+                        splits_detected += 1
+                        print(
+                            f"  ! {symbol}: SPLIT DETECTED, ratio={ratio:.4f}",
+                            file=sys.stderr,
+                        )
+                        # Route through the SAME ledger the nightly
+                        # adjudication uses, or one action gets applied twice.
+                        # Reachable and not hypothetical: an unrestated split
+                        # (MNST's shape) is adjudicated from the calendar on
+                        # the nightly path, which doubles the shares; days
+                        # later the vendor restates history (JMAT.L proves it
+                        # happens late), this resweep sees the drift, and
+                        # `detect_split` returns the same ratio again — shares
+                        # x4, with the cost-basis invariant hiding it on every
+                        # application. `detect_split` reports no effective
+                        # date, so the calendar supplies one; a drift-only
+                        # detection with no matching calendar entry keeps the
+                        # old unledgered behaviour and says so out loud.
+                        action = _match_detected_split(symbol, ratio)
+                        already = _adjudicated_keys()
+                        if action is None:
+                            print(
+                                "    (drift-inferred, no matching calendar "
+                                "entry — applying unledgered)",
+                                file=sys.stderr,
+                            )
+                            adjusted = _apply_split_to_holders(symbol, ratio)
+                            _warn_if_unheld(symbol, adjusted)
+                        elif already is None:
+                            print(
+                                "    (ledger unreadable — refusing to adjust "
+                                "holdings this run)",
+                                file=sys.stderr,
+                            )
+                            adjusted = []
+                        elif (action.symbol, action.effective) in already:
+                            print(
+                                f"    ({action.effective} action already "
+                                "adjudicated; holdings left alone)",
+                                file=sys.stderr,
+                            )
+                            adjusted = []
+                        else:
+                            adjusted = _apply_split_to_holders(
+                                symbol, action.shares_ratio
+                            )
+                            _record_adjudication(action, adjusted, 0)
+                            _warn_if_unheld(symbol, adjusted)
+                # The tripwire is off on a resweep: a real corporate action
+                # legitimately rewrites hundreds of rows there, and detect_split
+                # above is what adjudicates them. On the nightly path a
+                # wholesale rewrite of history is never legitimate.
+                merged = _write_rows(
+                    symbol, df, revise_from, guard_anomalies=not args.resweep
+                )
+                n, r, q = merged.appended, merged.revised, merged.quarantined
+                total_new += n
+                total_revised += r
+                total_quarantined += q
+                if args.close_run:
+                    reach = reached_by_exchange.setdefault(
+                        hole_bucket(symbol, crypto_bucket), [0, 0]
+                    )
+                    reach[1] += 1
+                    if (_served_closes(df) or {}).get(end.isoformat()) is True:
+                        reach[0] += 1
+                if merged.refused:
+                    # Kept for the adjudication pass below, which needs the
+                    # dates and ratios rather than the count.
+                    refused_rows[symbol] = merged.refused
+                for hole in merged.holes:
+                    # Past `end` is today's still-forming bar, which the vendor
+                    # serves with no close on every run (ten FX pairs, nightly).
+                    # This script never stores it, so it is never a hole.
+                    if hole <= end.isoformat():
+                        holes_by_date[hole] = holes_by_date.get(hole, 0) + 1
+                        by_date = holes_by_exchange.setdefault(hole_bucket(symbol, crypto_bucket), {})
+                        by_date[hole] = by_date.get(hole, 0) + 1
+                if i % 25 == 0 or n > 0 or r > 0 or q > 0:
+                    suffix = f", !{q} quarantined" if q else ""
+                    print(
+                        f"  [{i}/{len(symbols)}] {symbol}: +{n} rows, "
+                        f"~{r} revised{suffix}"
+                    )
+
+        if refresh_names and symbol not in registry_updates:  # a first ingest fetched it above
+            registry_updates[symbol] = resolve_name(symbol, _fetch_ticker_info(symbol))
+
+    if args.close_run and not args.names_only:
+        _report_close_run_reach(args.close_run, end, reached_by_exchange)
+
+    # The holes above are only the ones the vendor served INSIDE tonight's
+    # window, so a date it answered with no row at all on the next night
+    # vanished from view (follow-up review r6, I1). This reads the stored
+    # series instead, after tonight's rows landed. Not on a resweep or a
+    # backfill: those rewrite or re-append a whole window on purpose, and
+    # their callers are a human or the weekly held-ticker sweep.
+    store_gaps: StoreGapReport | None = None
+    if not (args.names_only or args.resweep or args.backfill):
+        store_gaps = _heal_store_gaps(
+            set(symbols),
+            end,
+            crypto_bucket,
+            full_universe=_universe_is_complete(args),
+        )
+        total_new += store_gaps.filled
+
+    if registry_updates:
+        existing_reg = load_registry()
+        merged = _merge_registry(existing_reg, registry_updates)
+        save_registry(merged)
+        non_null = sum(1 for v in registry_updates.values() if v.get("name"))
+
+        print(
+            f"Refreshed tickers registry: {non_null}/{len(registry_updates)} "
+            f"symbols resolved to a name."
+        )
+
+    # A refused row is not necessarily a defect: a real corporate action has
+    # the same shape as the units flip the tripwire hunts. Ask the vendor's own
+    # calendar before going red, because nothing else in the system can turn a
+    # refusal back into an ingest — `resweep-held-tickers` sweeps HELD tickers
+    # only, so a universe ticker nobody holds froze indefinitely while staying
+    # tradable at its stale price. Unexplained rows still go red.
+    adjudicated_symbols, rows_explained = _adjudicate(
+        refused_rows, start=end - timedelta(days=args.history_days), end=end
+    )
+    # Subtracted from the tripwire's own count, not reported independently:
+    # only rows positively explained by the vendor's calendar come off the
+    # tally, so any refusal this pass did not account for still goes red.
+    unadjudicated = total_quarantined - rows_explained
+
+    # Derived, not tracked in parallel: the two populations partition every
+    # failure, so a separate counter could only ever disagree with them.
+    failures = covered_failures + len(unresolved)
+
+    if args.names_only:
+        print(f"\nDone (names-only).")
+    else:
+        print(
+            f"\nDone. Wrote {total_new} new rows ({total_revised} revised) "
+            f"across {len(symbols)} symbols. {failures} failures."
+            + (f" {splits_detected} split(s) detected." if splits_detected else "")
+            + (
+                f" {adjudicated_symbols} symbol(s) ADJUDICATED against the "
+                "vendor's action calendar."
+                if adjudicated_symbols
+                else ""
+            )
+            + (
+                f" {unadjudicated} row(s) QUARANTINED — see "
+                "data/market/quarantine/."
+                if unadjudicated
+                else ""
+            )
+        )
+    # A symbol the store has never covered is a different fault from one that
+    # stopped answering, and folding the two together is what made the rate
+    # below unusable. 118 of the 120 failures on 2026-08-07 were Refinitiv-style
+    # codes in data/universes/stoxx600.json that Yahoo has no route for at all
+    # (AIRP.PA, BNPP.PA, CAGR.PA, ATCOa.ST — Yahoo wants AI.PA, BNP.PA, ACA.PA,
+    # ATCO-A.ST). They would never resolve, so failing the run on them would
+    # have frozen the store permanently. They are reported instead, because a
+    # universe carrying unfetchable tickers is a real defect — just not this
+    # script's, and not one a red run can fix. That particular defect was
+    # closed on 2026-09-09 (issue #36): the STOXX 600 resolver now keys on
+    # ISIN and asks Yahoo which listing it serves, so a symbol reaches the
+    # universe file only if the vendor can price it. What this WARN names
+    # from now on is a symbol the vendor has since dropped, or a universe
+    # entry added by hand.
+    if unresolved:
+        print(
+            f"\nWARN: {len(unresolved)} symbol(s) have never served a row and "
+            "have no store file. These are ticker-resolution failures, not a "
+            "vendor outage — most likely non-Yahoo symbol formats in "
+            f"data/universes/. First 10: {', '.join(sorted(unresolved)[:10])}",
+            file=sys.stderr,
+        )
+
+    # Neither must a run in which the vendor answered for almost nothing
+    # (2026-08-07 review, W2.5). This script exited 0 regardless of the
+    # failure count, so a total Yahoo outage produced a green run, "No OHLCV
+    # changes to commit", and a session pricing a stale store the next evening
+    # with nothing anywhere saying the data had not arrived.
+    #
+    # The threshold is a rate, not a count: individually dead symbols are
+    # normal and permanent here, so any absolute floor would either fire every
+    # night or never. The denominator is the symbols the store ALREADY COVERS,
+    # not the whole list. Against the whole list the guard was mis-calibrated
+    # from the day it shipped: the steady-state baseline was 121 failures of
+    # 1,150 (10.5%), already over the 10% limit, so every full-universe run
+    # from 2026-08-07 onward exited 1 and the store stopped advancing — the
+    # exact outage it was written to detect, caused by the detector. Against
+    # store coverage the same night reads 2 of ~1,030 (0.2%), and a genuine
+    # vendor outage still reads ~100%.
+    if not args.names_only and considered_covered:
+        covered_rate = covered_failures / considered_covered
+        if covered_rate > MAX_FAILURE_RATE:
+            print(
+                f"\nFAILED: {covered_failures} of {considered_covered} symbols "
+                "the store already covers returned no data "
+                f"({covered_rate:.0%}, limit {MAX_FAILURE_RATE:.0%}). A symbol "
+                "that served yesterday and serves nothing today is a "
+                "vendor-side or network failure, not a delisting. Whatever did "
+                "arrive is still committed, but the store is incomplete; a "
+                "session running against it tonight would price some books at "
+                "stale closes.",
+                file=sys.stderr,
+            )
+            return EXIT_VENDOR_OUTAGE
+
+    # A vendor-wide hole: symbols that DID answer, for a date they served with
+    # no close. The failure rate above cannot see it — every symbol "served" —
+    # and neither can the session's staleness guard, whose bound is four
+    # calendar days. Committable and red, like an outage: whatever arrived is
+    # kept, the failure issue is filed, and the retry is a human's
+    # `--resweep` (a short-window miss is a request-shape failure, not proof
+    # the day is lost — see the midas-market-data skill).
+    if not args.names_only:
+        wide = vendor_wide_holes(holes_by_date, considered_covered)
+        if wide:
+            listed = ", ".join(f"{d} ({n} symbols)" for d, n in wide.items())
+            print(
+                f"\nFAILED: vendor-wide hole — {listed} of {considered_covered} "
+                "covered symbols came back with no close (limit "
+                f"{MAX_HOLE_RATE:.0%}). The store did not advance for that date; "
+                "a session tonight prices those books a day stale. Retry with "
+                "`--resweep` over a longer window before the session.",
+                file=sys.stderr,
+            )
+            return EXIT_VENDOR_OUTAGE
+
+        # The same hole confined to one exchange (money review round 2, N4):
+        # every `.PA` name is ~6% of the universe, under the rate above, and
+        # its books price a day stale just the same.
+        by_exchange = exchange_wide_holes(holes_by_exchange, covered_by_exchange)
+        if by_exchange:
+            listed = "; ".join(
+                f"{ex or 'US (no suffix)'}: "
+                + ", ".join(
+                    f"{d} ({n} of {covered_by_exchange[ex]} symbols)"
+                    for d, n in holes.items()
+                )
+                for ex, holes in by_exchange.items()
+            )
+            print(
+                f"\nFAILED: exchange-wide hole — {listed} came back with no "
+                f"close or served nothing (limit {MAX_HOLE_RATE:.0%} of an "
+                "exchange's or asset class's covered symbols, or more than "
+                f"{SMALL_BUCKET_HOLE_SHARE:.0%} of a small one). The store "
+                "did not advance for that date there; a session tonight "
+                "prices those books a day stale. "
+                "Retry with `--resweep` over a longer window before the "
+                "session.",
+                file=sys.stderr,
+            )
+            return EXIT_VENDOR_OUTAGE
+
+    # Nothing is covered yet — a fork's first bootstrap, or a run after the
+    # store directory moved. The rate above cannot measure anything there, and
+    # returning 0 unconditionally would reopen W2.5's exact hole on the one run
+    # with nothing to fall back on. What IS decidable without coverage is
+    # whether the vendor answered at all: a bootstrap where every single symbol
+    # came back empty is an outage, while one where 1,030 of 1,150 served is a
+    # healthy bootstrap with a bad universe.
+    if not args.names_only and not considered_covered and symbols and not served:
+        print(
+            f"\nFAILED: none of the {len(symbols)} symbols returned any data, "
+            "and the store has no prior coverage to compare against. On an "
+            "empty store this is the only decidable outage signal — a "
+            "bootstrap in which the vendor answered for nothing at all.",
+            file=sys.stderr,
+        )
+        return EXIT_VENDOR_OUTAGE
+
+    # A quarantined row is a refusal to ingest something that looked like a
+    # unit flip or a bad tick. It is not a crash, but it must not scroll past
+    # in a green run either: exiting non-zero routes it to the workflow's
+    # failure-issue action, which files a persistent issue. Checked last so the
+    # reports above are never cut off by an early return.
+    if unadjudicated:
+        return EXIT_QUARANTINED
+    # Last, so an outage or a quarantine still names itself first; the gap is
+    # reported by `_heal_store_gaps` either way and held in its ledger.
+    if store_gaps is not None and (store_gaps.open or not store_gaps.ledger_readable):
+        return EXIT_STORE_GAP
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

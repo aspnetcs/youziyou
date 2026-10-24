@@ -1,0 +1,402 @@
+"""Portfolio state manager — disk-backed portfolio with trade execution and snapshots.
+
+Manages portfolio directories under a base directory, each identified by a strategy ID.
+
+Directory layout:
+    {base_dir}/{strategy_id}/
+        portfolio.json   — current cash + positions
+        trades.json      — full trade log (append-only)
+        snapshots.json   — daily portfolio snapshots (append-only)
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+from engine.corporate_actions import apply_split as _apply_split_positions
+from engine.types import Portfolio, Position, Trade
+
+
+#: Below this many shares a position is float dust, not a holding. Matches
+#: the epsilon `engine.restatement` uses so the two agree on when a position
+#: is closed.
+_DUST_SHARES = 1e-9
+
+
+class PortfolioManager:
+    """Manages portfolio state on disk for one or more strategies.
+
+    Parameters
+    ----------
+    base_dir:
+        Base directory that holds all portfolio subdirectories.
+        Each strategy gets its own subdirectory: {base_dir}/{strategy_id}/
+    """
+
+    def __init__(self, base_dir: Path) -> None:
+        self._base_dir = base_dir
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _portfolio_dir(self, strategy_id: str) -> Path:
+        return self._base_dir / strategy_id
+
+    def _portfolio_path(self, strategy_id: str) -> Path:
+        return self._portfolio_dir(strategy_id) / "portfolio.json"
+
+    def _trades_path(self, strategy_id: str) -> Path:
+        return self._portfolio_dir(strategy_id) / "trades.json"
+
+    def _snapshots_path(self, strategy_id: str) -> Path:
+        return self._portfolio_dir(strategy_id) / "snapshots.json"
+
+    def _read_json(self, path: Path) -> list | dict:
+        with path.open() as f:
+            return json.load(f)
+
+    def _write_json(self, path: Path, data: list | dict) -> None:
+        with path.open("w") as f:
+            json.dump(data, f, indent=2)
+
+    def _append_json_list(self, path: Path, item: dict) -> None:
+        """Append a dict to a JSON file containing a list."""
+        records: list[dict] = self._read_json(path)  # type: ignore[assignment]
+        records.append(item)
+        self._write_json(path, records)
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def initialize(
+        self,
+        strategy_id: str,
+        initial_capital: float,
+        currency: str = "USD",
+    ) -> None:
+        """Create portfolio directory with empty portfolio, trades, and snapshots files.
+
+        Does nothing if the portfolio directory already exists.
+        """
+        portfolio_dir = self._portfolio_dir(strategy_id)
+        portfolio_dir.mkdir(parents=True, exist_ok=True)
+
+        portfolio_path = self._portfolio_path(strategy_id)
+        if not portfolio_path.exists():
+            portfolio = Portfolio(
+                cash=initial_capital,
+                positions=[],
+                last_updated=date.today(),
+                currency=currency,
+            )
+            self._write_json(portfolio_path, portfolio.to_dict())
+
+        trades_path = self._trades_path(strategy_id)
+        if not trades_path.exists():
+            self._write_json(trades_path, [])
+
+        snapshots_path = self._snapshots_path(strategy_id)
+        if not snapshots_path.exists():
+            self._write_json(snapshots_path, [])
+
+    # ------------------------------------------------------------------
+    # Load
+    # ------------------------------------------------------------------
+
+    def load(self, strategy_id: str) -> Portfolio:
+        """Read and return the current portfolio from disk."""
+        path = self._portfolio_path(strategy_id)
+        data = self._read_json(path)
+        return Portfolio.from_dict(data)  # type: ignore[arg-type]
+
+    def load_trades(self, strategy_id: str) -> list[dict]:
+        """Read and return the full trade log from disk."""
+        return self._read_json(self._trades_path(strategy_id))  # type: ignore[return-value]
+
+    def load_snapshots(self, strategy_id: str) -> list[dict]:
+        """Read and return all daily snapshots from disk."""
+        return self._read_json(self._snapshots_path(strategy_id))  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------
+    # Trade execution
+    # ------------------------------------------------------------------
+
+    def apply_trade(self, strategy_id: str, trade: Trade) -> None:
+        """Apply a trade to the portfolio and append it to the trade log.
+
+        BUY:
+            - Deduct total + fees from cash.
+            - If the ticker already has an open position, update avg_cost
+              using a weighted average (average-in semantics).
+            - Otherwise, create a new position.
+
+        SELL:
+            - Add total - fees to cash.
+            - Reduce shares from the existing position.
+            - Remove the position entirely when shares reach zero.
+
+        Raises
+        ------
+        ValueError
+            If action is not "BUY" or "SELL", or if trying to sell more
+            shares than currently held.
+        """
+        portfolio = self.load(strategy_id)
+
+        action = trade.action.upper()
+
+        if action == "BUY":
+            cost = trade.total + trade.fees
+            if cost > portfolio.cash:
+                raise ValueError(
+                    f"Insufficient cash for {trade.ticker}: "
+                    f"trade costs ${cost:,.2f} but only ${portfolio.cash:,.2f} available"
+                )
+            portfolio.cash -= cost
+
+            # Find existing position for this ticker.
+            existing = next(
+                (p for p in portfolio.positions if p.ticker == trade.ticker), None
+            )
+            if existing is not None:
+                # Weighted average cost.
+                total_shares = existing.shares + trade.shares
+                existing.avg_cost = (
+                    existing.shares * existing.avg_cost + trade.shares * trade.price
+                ) / total_shares
+                existing.shares = total_shares
+            else:
+                new_position = Position(
+                    ticker=trade.ticker,
+                    shares=trade.shares,
+                    avg_cost=trade.price,
+                    date_opened=trade.timestamp.date(),
+                    grid_level=0,
+                )
+                portfolio.positions.append(new_position)
+
+        elif action == "SELL":
+            existing = next(
+                (p for p in portfolio.positions if p.ticker == trade.ticker), None
+            )
+            if existing is None:
+                raise ValueError(
+                    f"Cannot sell {trade.ticker}: no open position for strategy {strategy_id!r}"
+                )
+            # Epsilon on this comparison too, and for the mirror-image reason
+            # (2026-08-07 review, W7.4). `0.3 - 0.1` holds 0.19999999999999998
+            # shares, so an agent selling the 0.2 it believes it owns — and
+            # does own — was refused for 2e-17 of a share. Found by the dust
+            # test below, not by the review.
+            if trade.shares > existing.shares + _DUST_SHARES:
+                raise ValueError(
+                    f"Cannot sell {trade.shares} shares of {trade.ticker}: "
+                    f"only {existing.shares} shares held"
+                )
+
+            # A sale can cost more than it raises: the equity fee has a floor,
+            # so a EUR 0.40 disposal nets EUR -0.85. The broker's rails would
+            # normally stop that arriving here, but `apply_trade` is also
+            # called by the restatement and baseline paths, and a portfolio
+            # with negative cash is not a state any consumer handles
+            # (2026-08-07 review, W7.4). Symmetric with the BUY guard above.
+            proceeds = trade.total - trade.fees
+            if portfolio.cash + proceeds < 0:
+                raise ValueError(
+                    f"Sale of {trade.ticker} would drive cash negative: "
+                    f"proceeds {proceeds:,.2f} (total {trade.total:,.2f} less "
+                    f"fees {trade.fees:,.2f}) against cash "
+                    f"{portfolio.cash:,.2f}"
+                )
+            portfolio.cash += proceeds
+
+            existing.shares -= trade.shares
+            # Epsilon, not `== 0`: 32 of the 227 committed trades are
+            # fractional, and selling out of a fractional position in two legs
+            # leaves float dust (1e-16 shares) that `== 0` treats as an open
+            # position forever. `engine.restatement` already used 1e-9; this
+            # path was the one place still comparing exactly.
+            if abs(existing.shares) < _DUST_SHARES:
+                portfolio.positions = [
+                    p for p in portfolio.positions if p.ticker != trade.ticker
+                ]
+
+        else:
+            raise ValueError(
+                f"Invalid trade action: {trade.action!r}. Expected 'BUY' or 'SELL'."
+            )
+
+        portfolio.last_updated = trade.timestamp.date()
+
+        # Persist updated portfolio.
+        self._write_json(self._portfolio_path(strategy_id), portfolio.to_dict())
+
+        # Append trade to log.
+        trade_record = {
+            "id": trade.id,
+            "timestamp": trade.timestamp.isoformat(),
+            "action": trade.action,
+            "ticker": trade.ticker,
+            "shares": trade.shares,
+            "price": trade.price,
+            "total": trade.total,
+            "fees": trade.fees,
+            "reasoning": trade.reasoning,
+        }
+        self._append_json_list(self._trades_path(strategy_id), trade_record)
+
+    # ------------------------------------------------------------------
+    # Corporate actions
+    # ------------------------------------------------------------------
+
+    def apply_split(self, strategy_id: str, ticker: str, ratio: float) -> bool:
+        """Adjust a held position's shares/avg_cost for a detected stock split.
+
+        Delegates the pure shares/avg_cost arithmetic to
+        ``engine.corporate_actions.apply_split`` — cost basis
+        (``shares × avg_cost``) is preserved by construction there — then
+        persists ``portfolio.json`` only if the ticker was actually held.
+        Same read-mutate-write shape as ``apply_trade``, the only other
+        writer of ``portfolio.json``; unlike a trade, a split leaves cash
+        and every other position untouched, so nothing is appended to
+        ``trades.json``.
+
+        Parameters
+        ----------
+        strategy_id:
+            Target portfolio.
+        ticker:
+            The split-affected ticker.
+        ratio:
+            ``stored_close / fetched_close`` for the overlapping pre-split
+            rows, as returned by ``engine.corporate_actions.detect_split``.
+
+        Returns
+        -------
+        bool
+            True if the agent held ``ticker`` and its position was
+            adjusted. False if it doesn't hold that ticker — a no-op, since
+            most agents won't hold every split-affected ticker.
+        """
+        path = self._portfolio_path(strategy_id)
+        data = self._read_json(path)
+        positions: list[dict] = data.get("positions", [])  # type: ignore[assignment]
+        if not any(p["ticker"] == ticker for p in positions):
+            return False
+
+        data["positions"] = _apply_split_positions(positions, ticker, ratio)  # type: ignore[index]
+        self._write_json(path, data)
+        return True
+
+    # ------------------------------------------------------------------
+    # Snapshots
+    # ------------------------------------------------------------------
+
+    def add_snapshot(
+        self,
+        strategy_id: str,
+        snapshot_date: date,
+        portfolio_value: float,
+        cash: float,
+        positions_value: float,
+        benchmarks: dict,
+        session_date: date | None = None,
+        stale_marks: list[dict] | None = None,
+        writer: str | None = None,
+    ) -> bool:
+        """Append a daily snapshot to snapshots.json. History is immutable.
+
+        The equity curve is keyed on ``snapshot_date`` — the *market* date the
+        valuation was priced at — because that is the axis the baseline series
+        lives on (``engine.baselines`` dates every point from the price series,
+        so a session-dated agent curve would drift off its own benchmark).
+
+        ``session_date`` records *when the row was observed*, which is a
+        different thing and the reason this is not a plain upsert. A resumed or
+        re-run session must be able to correct its own row; a *later* session
+        must never rewrite an earlier one's. Without that distinction a Monday
+        session whose OHLCV store has not advanced past Friday silently
+        overwrites the weekend's already-published value with a composition that
+        includes trades made days afterwards.
+
+        The write is therefore append-or-refuse: an existing row is replaced
+        only when it carries the *same* ``session_date``. Anything else — an
+        older session, a newer one, or a legacy row predating this field — is
+        refused rather than clobbered, so the failure is loud and history stands.
+
+        Parameters
+        ----------
+        strategy_id:
+            Target portfolio.
+        snapshot_date:
+            Market date the valuation was priced at. Keys the row.
+        portfolio_value:
+            Total portfolio value (cash + positions_value).
+        cash:
+            Cash component.
+        positions_value:
+            Market value of all open positions.
+        benchmarks:
+            Dict of benchmark values, e.g. {"sp500": 5200.0, "btc": 65000.0}.
+        session_date:
+            The session that observed this valuation. Defaults to
+            ``snapshot_date``, which is the honest reading for a backfill
+            replaying history one market day at a time.
+        stale_marks:
+            ``[{ticker, price_date}]`` for each position marked at a close its
+            exchange has since passed (`engine.stale_marks`). Written on the
+            row when given, an empty list included ("checked, none"); omitted
+            when ``None``, so a caller that never checked never claims to have.
+            Rows written before 2026-10-03 carry no key and are never touched.
+        writer:
+            Which job wrote the row, when it is not the session: the
+            valuation-only refresh passes ``"refresh"`` and the row records it.
+            The session passes nothing and its rows carry no key. A row is
+            replaced only by the same writer on the same ``session_date``: a
+            Monday refresh stamps its Sunday row with Monday's session date,
+            and a Monday session whose market date stayed at Sunday carries the
+            same date, so the session date alone let it rewrite the published
+            row (#89).
+
+        Returns
+        -------
+        bool
+            True if the snapshot was written, False if it was refused because
+            an earlier session already owns that market date. Callers should
+            surface a refusal rather than swallow it.
+        """
+        observed = session_date or snapshot_date
+        snapshot = {
+            "date": snapshot_date.isoformat(),
+            "session_date": observed.isoformat(),
+            "portfolio_value": portfolio_value,
+            "cash": cash,
+            "positions_value": positions_value,
+            "benchmarks": benchmarks,
+        }
+        if stale_marks is not None:
+            snapshot["stale_marks"] = list(stale_marks)
+        if writer is not None:
+            snapshot["writer"] = writer
+        path = self._snapshots_path(strategy_id)
+        records: list[dict] = self._read_json(path)  # type: ignore[assignment]
+        date_key = snapshot["date"]
+        for i, existing in enumerate(records):
+            if existing.get("date") != date_key:
+                continue
+            # Same session correcting itself is the one legitimate overwrite.
+            # A missing session_date is a legacy row: never equal, so refused.
+            if existing.get("session_date") != snapshot["session_date"]:
+                return False
+            if existing.get("writer") != snapshot.get("writer"):
+                return False
+            records[i] = snapshot
+            self._write_json(path, records)
+            return True
+        records.append(snapshot)
+        self._write_json(path, records)
+        return True
